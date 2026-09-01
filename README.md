@@ -278,14 +278,20 @@ those, and `python3` is in the workflow's install list for LLVM's sake.
 | `curl` | fetches the toolchain and the sources |
 | `tar`, `xz` | unpacks them |
 | `cmake` ≥ 3.20, `ninja` | LLVM's build system |
+| a host C/C++ compiler | step 4 builds the tablegen tools with it, not with the cross-compiler |
 
 ```sh
 # macOS
 brew install make cmake ninja xz
 
 # Debian / Ubuntu
-sudo apt install make cmake ninja-build curl ca-certificates xz-utils
+sudo apt install make cmake ninja-build gcc g++ python3 curl ca-certificates xz-utils
 ```
+
+The host compiler is easy to overlook, because steps 1 to 3 use only the
+downloaded cross-toolchain and pass without one; step 4 is the first thing that
+needs it, and CMake reports it as `No CMAKE_C_COMPILER could be found`. macOS
+always has Apple clang, so this only bites on a slim Linux image.
 
 Neither sibling repository needs CMake or Ninja, so these are new to SepiaOS;
 CI installs them too.

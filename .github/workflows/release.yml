@@ -179,11 +179,16 @@ jobs:
     steps:
       # Before checkout on purpose: without git in the container,
       # actions/checkout silently falls back to downloading a tarball.
+      #
+      # gcc/g++ are the *host* compiler, for the tablegen tools in step 4; the
+      # cross toolchain is downloaded and covers nothing that runs here. Keep
+      # this list identical to ci.yml's, or a release builds in a container CI
+      # never tested.
       - name: Install build tools
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            make cmake ninja-build python3 git curl ca-certificates xz-utils
+            make cmake ninja-build gcc g++ python3 git curl ca-certificates xz-utils
 
       # The release branch, not the dispatched ref: this is the whole point of
       # having branched.

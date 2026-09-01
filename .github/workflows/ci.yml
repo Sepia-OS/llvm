@@ -60,11 +60,18 @@ jobs:
       # them. python3 is LLVM's own build-time requirement, not this repo's.
       # xz-utils unpacks the toolchain and the LLVM tarball, and packs the
       # release asset.
+      #
+      # g++ is the host compiler, and it is easy to leave out: steps 1 to 3 use
+      # only the *cross* toolchain, which is self-contained, so they pass
+      # happily without it and step 4 is the first thing that needs it. It then
+      # fails as "No CMAKE_C_COMPILER could be found", which reads like a broken
+      # CMake invocation rather than a missing package. A development machine
+      # never shows this - macOS always has Apple clang.
       - name: Install build tools
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            make cmake ninja-build python3 git curl ca-certificates xz-utils
+            make cmake ninja-build gcc g++ python3 git curl ca-certificates xz-utils
 
       - uses: actions/checkout@v5
 
