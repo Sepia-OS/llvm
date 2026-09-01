@@ -17,6 +17,8 @@ gmake sysroot           # build the musl sysroot the target links against
 gmake sysroot-check     # prove C++ links dynamically against it
 gmake tablegen          # host tablegen tools the cross-build needs
 gmake llvm              # cross-build clang and lld (the long one)
+gmake runtimes          # compiler-rt, libunwind, libc++abi, libc++
+gmake objc-runtime      # the GNUstep Objective-C runtime
 gmake stage             # install, prune and strip what ships
 gmake stage-check       # aarch64, musl loader, complete library closure
 gmake dist              # pack it into dist/ as the release asset
@@ -155,14 +157,80 @@ The built binaries are read back and checked: aarch64, and pointing at the
 musl loader the device has. A cross-build succeeds just as happily when it has
 produced binaries for the wrong machine.
 
+### 5b. Build the LLVM runtimes
+
+Step 5 produces a compiler. This produces the libraries that compiler emits
+calls into, without which the shipped `clang` parses a program, generates code
+for it, and then cannot link it: the driver asks for a builtins library, and for
+C++ a standard library, and neither would be on the card.
+
+| | |
+|---|---|
+| `compiler-rt` | the builtins — `__udivti3` and friends. Replaces `libgcc.a`. |
+| `libunwind` | the unwinder. Replaces the one inside `libgcc_s`. |
+| `libcxxabi` | the Itanium C++ ABI: exceptions, RTTI, vtable layout. |
+| `libcxx` | the C++ standard library, headers included. |
+
+They are built with the **cross GCC**, not with a clang, which looks wrong and
+is deliberate. A clang bootstrap has a chicken-and-egg step — CMake's compiler
+check links a test program, which needs the builtins this build has not produced
+yet — and it would need a host clang that can target musl. The cross GCC has its
+own libgcc, links test programs on the first try, and is the same compiler,
+sysroot and flags step 5 already proved. libc++ supports being built by GCC.
+What matters is which runtime the *shipped clang defaults to*, and that is set
+in step 5 — `CLANG_RTLIB`, `CLANG_CXX_STDLIB` and `CLANG_UNWINDLIB`, which
+default to compiler-rt, libc++ and libunwind and can be set back to GCC's.
+
+`LLVM_ENABLE_PER_TARGET_RUNTIME_DIR` is off. On, libc++ installs into
+`lib/<triple>/`, which clang would find but the *loader* would not — it is not
+on musl's default search path, so every program linked against libc++ would fail
+to start. The device hosts one target, so the flat layout is both simpler and
+correct.
+
+### 5c. Build the Objective-C runtime
+
+Objective-C and Objective-C++ are frontends `clang` already has. What it does
+not have is a runtime to emit calls into, and that runtime is not an LLVM
+component at all — LLVM ships the compiler and nothing else. It comes from
+[GNUstep's libobjc2](https://github.com/gnustep/libobjc2), the modern
+non-fragile-ABI runtime, with ARC.
+
+Three things about it shape this step:
+
+- **It can only be built by clang.** Its `CMakeLists.txt` refuses any other
+  compiler outright, because the ABI it implements is one only clang emits. So
+  this is the one step that needs a clang on the build host — `HOST_CLANG`,
+  which is checked before it is used: it must exist and must actually emit
+  aarch64 ELF, which is asserted by compiling a probe and reading the result
+  back rather than assumed.
+- **It carries its own blocks runtime**, so `-fblocks` needs nothing further.
+- **It links against libgcc**, unlike everything the shipped clang will emit. A
+  host clang looks for compiler-rt in *its own* resource directory rather than
+  in the sysroot, so using the builtins from step 5b would mean overriding
+  `-resource-dir` and dragging that clang's builtin headers along with it.
+  `libgcc_s.so.1` is on the card regardless — the toolchain binaries need it —
+  and both unwinders implement the same ABI, so this is a wart rather than a
+  defect. It is written down here rather than hidden.
+
+The ABI the on-device clang defaults to is `gnustep-2.2`, and it reaches the
+driver through a **clang configuration file** staged at
+`/usr/lib/clang-config/<triple>.cfg`: there is no `CLANG_DEFAULT_OBJC_RUNTIME`
+to build it in. Clang is built with `CLANG_CONFIG_FILE_SYSTEM_DIR` set to a path
+relative to its own binary, so the staged tree stays relocatable, and nobody has
+to pass a flag to compile Objective-C on the device.
+
 ### 6. Stage the install tree
 
-The built toolchain is installed into a staging tree, stripped, and reduced to
-what is actually useful on a device: no static archives, no test binaries, no
-documentation.
+Three build trees install into one staging tree — the compiler from step 5, the
+runtimes from 5b and the Objective-C runtime from 5c — which is then stripped
+and reduced to what is actually useful on a device: no static archives, no test
+binaries, no documentation. The clang configuration file that gives the driver
+its Objective-C ABI is written here too.
 
 Because the linkage is dynamic, `libstdc++.so.6` and `libgcc_s.so.1` are part
-of the product. They come from the cross-toolchain, they are not in the
+of the product. They ship even though user code now defaults to compiler-rt and
+libc++: the `clang` binary was itself built by GCC and will not start without
+them. They come from the cross-toolchain, they are not in the
 sysroot, and nothing in `rootfs` provides them — so they travel inside this
 repository's release asset rather than becoming something `rootfs` has to know
 to install. `gmake runtime-libs` lists them.
@@ -185,7 +253,13 @@ own builtin headers, 253 of them, without which it cannot compile anything.
 `gmake stage-check` reads the result back and asserts that every staged binary
 is aarch64, uses the musl loader, and has a complete shared-library closure —
 every `NEEDED` entry either staged here or supplied by `rootfs`'s musl, which
-is the only thing allowed to be missing.
+is the only thing allowed to be missing. It then checks that each language has
+what it needs on the card: clang's builtin headers for C, libc++'s headers and
+libraries for C++, the objc headers and `libobjc.so` for Objective-C, the
+builtins archive for linking anything at all, and the config file that sets the
+Objective-C ABI. That is a **layout** check — it says the pieces are where the
+driver looks, not that a program built with them runs. Only the device, or an
+emulator, can say that.
 
 Size is a product constraint here rather than a build convenience. The SepiaOS
 userland today is musl plus busybox — a few megabytes — and the image is
@@ -248,16 +322,30 @@ which is never deleted.
 
 ## Status
 
-Steps 1 to 7 are implemented and verified end to end: `gmake stage` produces a
-189 MiB tree holding `clang`, `lld`, twelve LLVM binutils equivalents and the
-two C++ runtime libraries, all aarch64, all linked against musl 1.2.6, and
-`gmake dist` packs it for release.
+Steps 1 to 6 were verified end to end on macOS **before** the runtimes were
+added: `gmake stage` produced a 189 MiB tree holding `clang`, `lld`, twelve LLVM
+binutils equivalents and the two C++ runtime libraries, all aarch64, all linked
+against musl 1.2.6.
 
-Both hosts are covered. Steps 1 and 3 have been verified on Linux/x86_64 in
-`debian:trixie-slim` — the container the sibling repositories use for CI —
-using the bootlin toolchain, producing the same musl 1.2.6 sysroot. The
-container has not yet run steps 4 to 6 itself; the first CI run is what proves
-those, and `python3` is in the workflow's install list for LLVM's sake.
+**Steps 5b and 5c, and the changes to 5 and 6 that go with them, have not been
+run yet** — not on macOS and not in CI. They are written from LLVM 23.1.0's own
+CMake options and clang's driver sources, and every one of them asserts its
+result rather than assuming it, but a build is the only thing that settles
+whether they work. Expect the first runs to find something.
+
+What is verified about them so far: libobjc2 2.3's archive unpacks where the
+Makefile expects and its digest is recorded in `checksums/`; Apple clang 21
+emits aarch64 ELF for the musl triple, so `HOST_CLANG` needs no setting on
+macOS; every CMake option used exists in 23.1.0.
+
+Steps 1 to 3 have been verified on Linux/x86_64 in `debian:trixie-slim` — the
+container CI uses — with the bootlin toolchain, producing the same musl 1.2.6
+sysroot. Step 4 needed `gcc`/`g++` added to the container, which is what the
+first CI run found.
+
+**Nothing here has been run on a Raspberry Pi.** `stage-check` proves the layout,
+not that the toolchain compiles a program on the device; that needs hardware or
+an emulator.
 
 ## Repository layout
 
@@ -279,14 +367,21 @@ those, and `python3` is in the workflow's install list for LLVM's sake.
 | `tar`, `xz` | unpacks them |
 | `cmake` ≥ 3.20, `ninja` | LLVM's build system |
 | a host C/C++ compiler | step 4 builds the tablegen tools with it, not with the cross-compiler |
+| a host `clang` | step 5c: libobjc2 refuses to be built by anything else |
 
 ```sh
 # macOS
 brew install make cmake ninja xz
 
 # Debian / Ubuntu
-sudo apt install make cmake ninja-build gcc g++ python3 curl ca-certificates xz-utils
+sudo apt install make cmake ninja-build gcc g++ clang python3 curl ca-certificates xz-utils
 ```
+
+macOS needs nothing extra for the clang: Apple's own compiles for
+`aarch64-unknown-linux-musl` (verified on Apple clang 21). If a release ever
+cannot, `brew install llvm` and set
+`HOST_CLANG=/opt/homebrew/opt/llvm/bin/clang` — `gmake objc-runtime` checks the
+compiler before it uses it and says so rather than failing deep inside CMake.
 
 The host compiler is easy to overlook, because steps 1 to 3 use only the
 downloaded cross-toolchain and pass without one; step 4 is the first thing that

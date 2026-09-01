@@ -643,10 +643,30 @@ tablegen-info: $(TBLGEN_STAMP) ## Show the host tablegen binaries
 #   internal headers, the static archives, the utilities that exist to build
 #   LLVM rather than to use it.
 #
-# The linker and runtime defaults are left at libgcc and libstdc++ on purpose:
-# those are exactly the runtime libraries this build already ships (see
-# runtime-libs), so the on-device clang defaults to what is on the device.
+# The linker and runtime defaults point at LLVM's own runtimes, which step 5b
+# cross-builds and step 6 stages. They are variables rather than literals so a
+# card can be built the other way - CLANG_RTLIB=libgcc CLANG_CXX_STDLIB=libstdc++
+# reverts to GCC's runtime, which is what the toolchain itself is linked against.
 # ---------------------------------------------------------------------------
+
+# What the on-device clang reaches for when it is given no flags. compiler-rt
+# and libc++ are what step 5b builds and step 6 ships; leaving these at their
+# upstream defaults would make the shipped clang default to a libgcc and a
+# libstdc++ that are not on the card.
+CLANG_RTLIB      ?= compiler-rt
+CLANG_CXX_STDLIB ?= libc++
+CLANG_UNWINDLIB  ?= libunwind
+
+# Where the shipped clang looks for its own configuration file. Relative paths
+# are resolved against the directory holding the binary (clang/lib/Driver/
+# Driver.cpp), so ../lib/clang-config means /usr/lib/clang-config for a clang in
+# /usr/bin and the staged tree stays relocatable. This is how the Objective-C
+# runtime default reaches the driver: there is no CLANG_DEFAULT_OBJC_RUNTIME.
+CLANG_CFG_DIR := ../lib/clang-config
+# The same directory seen from the root of the staged tree. These two must
+# agree: the first is what the compiler was built to look for, the second is
+# where step 6 puts the file.
+CLANG_CFG_STAGE := usr/lib/clang-config
 
 TARGET_BUILD := $(BUILD_DIR)/target
 TARGET_LOG    = $(TARGET_BUILD)/build.log
@@ -678,7 +698,7 @@ SCRUB_ENV := env -u CPPFLAGS -u LDFLAGS -u CFLAGS -u CXXFLAGS \
                  -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH
 
 TARGET_CFG := $(TARGET_BUILD)/.config
-TARGET_SIG  = $(LLVM_VERSION)|$(LLVM_PROJECTS)|$(LLVM_TARGETS)|$(LLVM_TRIPLE)|$(TC_VENDOR)|$(TC_VERSION)|$(MUSL_VERSION)|$(CROSS_COMPILE)
+TARGET_SIG  = $(LLVM_VERSION)|$(LLVM_PROJECTS)|$(LLVM_TARGETS)|$(LLVM_TRIPLE)|$(TC_VENDOR)|$(TC_VERSION)|$(MUSL_VERSION)|$(CROSS_COMPILE)|$(CLANG_RTLIB)|$(CLANG_CXX_STDLIB)|$(CLANG_UNWINDLIB)|$(CLANG_CFG_DIR)
 $(eval $(call config_stamp_rule,$(TARGET_CFG),$(TARGET_SIG)))
 
 TARGET_CMAKE_FLAGS = \
@@ -714,7 +734,11 @@ TARGET_CMAKE_FLAGS = \
   -DLLVM_ENABLE_ZSTD=OFF \
   -DLLVM_ENABLE_LIBXML2=OFF \
   -DLLVM_ENABLE_TERMINFO=OFF \
-  -DLLVM_ENABLE_LIBEDIT=OFF
+  -DLLVM_ENABLE_LIBEDIT=OFF \
+  -DCLANG_DEFAULT_RTLIB=$(CLANG_RTLIB) \
+  -DCLANG_DEFAULT_CXX_STDLIB=$(CLANG_CXX_STDLIB) \
+  -DCLANG_DEFAULT_UNWINDLIB=$(CLANG_UNWINDLIB) \
+  -DCLANG_CONFIG_FILE_SYSTEM_DIR=$(CLANG_CFG_DIR)
 
 .PHONY: llvm
 llvm: $(TARGET_STAMP) ## Cross-build clang and lld for the target
@@ -766,13 +790,366 @@ llvm-info: $(TARGET_STAMP) ## Show the cross-built binaries and what they need
 	@du -sh $(TARGET_BUILD)/bin $(TARGET_BUILD)/lib 2>/dev/null | sed 's/^/  /' || true
 
 # ---------------------------------------------------------------------------
+# Step 5b - the LLVM runtimes
+#
+# Step 5 produces a compiler; this produces the libraries that compiler emits
+# calls into. Without them the shipped clang starts, parses and generates code,
+# and then cannot link a single program: its driver asks for a builtins library
+# and, for C++, a standard library, and neither is on the card.
+#
+#   compiler-rt   the builtins (__udivti3 and friends). Replaces libgcc.a.
+#   libunwind     the unwinder. Replaces libgcc_s's.
+#   libcxxabi     the Itanium C++ ABI - exceptions, RTTI, the vtable layout.
+#   libcxx        the C++ standard library, headers included.
+#
+# Built with the *cross GCC*, not with a clang, which is the unusual-looking
+# choice here and is deliberate. A clang bootstrap has a chicken-and-egg step -
+# CMake's compiler check links a test program, which needs the builtins that
+# this build has not produced yet - and it would need a host clang that can
+# target musl. The cross GCC has its own libgcc and links test programs on the
+# first try, and it is the same compiler, sysroot and flags step 5 already
+# proved. libc++ supports being built by GCC; what matters is which runtime the
+# *shipped clang defaults to*, and that is set in step 5, not here.
+#
+# LLVM_ENABLE_PER_TARGET_RUNTIME_DIR is OFF on purpose. ON installs libc++ into
+# lib/<triple>/, which clang would find but the *loader* would not - it is not
+# on musl's default search path, so every program linked against libc++ would
+# fail to start. This device hosts exactly one target, so the flat layout is
+# both simpler and correct.
+#
+# Installed into the sysroot as well as into the stage: step 5c compiles
+# Objective-C++ against these headers, and --sysroot is how it finds them.
+# ---------------------------------------------------------------------------
+
+LLVM_RUNTIMES ?= compiler-rt;libunwind;libcxxabi;libcxx
+
+RUNTIMES_BUILD := $(BUILD_DIR)/runtimes
+RUNTIMES_LOG    = $(RUNTIMES_BUILD)/build.log
+RUNTIMES_STAMP  = $(RUNTIMES_BUILD)/.built
+
+RUNTIMES_CFG := $(RUNTIMES_BUILD)/.config
+RUNTIMES_SIG  = $(LLVM_VERSION)|$(LLVM_RUNTIMES)|$(LLVM_TRIPLE)|$(TC_VENDOR)|$(TC_VERSION)|$(MUSL_VERSION)|$(CROSS_COMPILE)
+$(eval $(call config_stamp_rule,$(RUNTIMES_CFG),$(RUNTIMES_SIG)))
+
+RUNTIMES_CMAKE_FLAGS = \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_SYSTEM_NAME=Linux \
+  -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+  -DCMAKE_SYSROOT=$(abspath $(SYSROOT)) \
+  -DCMAKE_C_COMPILER=$(CROSS)gcc \
+  -DCMAKE_CXX_COMPILER=$(CROSS)g++ \
+  -DCMAKE_ASM_COMPILER=$(CROSS)gcc \
+  -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+  -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+  -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+  -DCMAKE_INSTALL_PREFIX=/usr \
+  "-DCMAKE_EXE_LINKER_FLAGS=$(CROSS_LDFLAGS)" \
+  "-DCMAKE_SHARED_LINKER_FLAGS=$(CROSS_LDFLAGS)" \
+  "-DCMAKE_MODULE_LINKER_FLAGS=$(CROSS_LDFLAGS)" \
+  -DLLVM_ENABLE_RUNTIMES="$(LLVM_RUNTIMES)" \
+  -DLLVM_DEFAULT_TARGET_TRIPLE=$(LLVM_TRIPLE) \
+  -DLLVM_TARGETS_TO_BUILD=$(LLVM_TARGETS) \
+  -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF \
+  -DLLVM_INCLUDE_TESTS=OFF \
+  -DCOMPILER_RT_BUILD_BUILTINS=ON \
+  -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+  -DCOMPILER_RT_BUILD_XRAY=OFF \
+  -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+  -DCOMPILER_RT_BUILD_PROFILE=OFF \
+  -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
+  -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+  -DCOMPILER_RT_BUILD_ORC=OFF \
+  -DCOMPILER_RT_BUILD_GWP_ASAN=OFF \
+  -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+  -DLIBUNWIND_ENABLE_STATIC=OFF \
+  -DLIBUNWIND_INCLUDE_TESTS=OFF \
+  -DLIBUNWIND_INSTALL_LIBRARY_DIR=lib \
+  -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+  -DLIBCXXABI_ENABLE_STATIC=OFF \
+  -DLIBCXXABI_INCLUDE_TESTS=OFF \
+  -DLIBCXXABI_INSTALL_LIBRARY_DIR=lib \
+  -DLIBCXX_HAS_MUSL_LIBC=ON \
+  -DLIBCXX_ENABLE_STATIC=OFF \
+  -DLIBCXX_INCLUDE_TESTS=OFF \
+  -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+  -DLIBCXX_INSTALL_LIBRARY_DIR=lib
+
+.PHONY: runtimes
+runtimes: $(RUNTIMES_STAMP) ## Cross-build compiler-rt, libunwind, libc++abi and libc++
+	@echo "  READY    runtimes -> $(SYSROOT)/usr/lib"
+
+$(RUNTIMES_STAMP): $(MUSL_STAMP) $(LLVM_STAMP) $(RUNTIMES_CFG) Makefile
+	@$(call require_build_tools)
+	@$(call assert_cross_compiler)
+	@mkdir -p $(RUNTIMES_BUILD)
+	@echo "  CONFIG   runtimes $(LLVM_RUNTIMES) (log: $(RUNTIMES_LOG))"
+	@$(SCRUB_ENV) cmake -G Ninja -S $(LLVM_SRC)/runtimes -B $(RUNTIMES_BUILD) \
+	   $(RUNTIMES_CMAKE_FLAGS) > $(RUNTIMES_LOG) 2>&1 || { \
+	   tail -40 $(RUNTIMES_LOG) >&2; \
+	   echo "  FAIL     configure (full log: $(RUNTIMES_LOG))" >&2; exit 1; }
+	@echo "  BUILD    runtimes (-j$(JOBS))"
+	@$(SCRUB_ENV) cmake --build $(RUNTIMES_BUILD) --parallel $(JOBS) \
+	   >> $(RUNTIMES_LOG) 2>&1 || { \
+	   tail -40 $(RUNTIMES_LOG) >&2; \
+	   echo "  FAIL     build (full log: $(RUNTIMES_LOG))" >&2; exit 1; }
+	@echo "  INSTALL  runtimes -> $(SYSROOT)"
+	@DESTDIR=$(abspath $(SYSROOT)) $(SCRUB_ENV) cmake --install $(RUNTIMES_BUILD) \
+	   >> $(RUNTIMES_LOG) 2>&1 || { \
+	   tail -30 $(RUNTIMES_LOG) >&2; \
+	   echo "  FAIL     install (full log: $(RUNTIMES_LOG))" >&2; exit 1; }
+	@$(call assert_runtimes,$(abspath $(SYSROOT))/usr)
+	@touch $@
+
+# $(1) the usr/ prefix to look under. The builtins archive is *found* rather
+# than named: its filename and subdirectory depend on the per-target layout
+# switch and on the OS name compiler-rt derives, and a wrong guess here would
+# ship a toolchain that cannot link. If it moves, this prints the tree rather
+# than failing mutely.
+define assert_runtimes
+	set -e; \
+	for l in libc++.so.1 libc++abi.so.1 libunwind.so.1; do \
+	  p=$(1)/lib/$$l; \
+	  [ -e "$$p" ] || { echo "  FAIL     $$l was not installed" >&2; exit 1; }; \
+	  $(CROSS)readelf -h "$$p" | grep -q AArch64 \
+	    || { echo "  FAIL     $$l is not aarch64" >&2; exit 1; }; \
+	done; \
+	[ -f $(1)/include/c++/v1/vector ] \
+	  || { echo "  FAIL     libc++ headers are missing from $(1)/include/c++/v1" >&2; exit 1; }; \
+	b=$$(find $(1)/lib/clang/$(LLVM_MAJOR) -name 'libclang_rt.builtins*.a' -print 2>/dev/null | sed -n '1p'); \
+	if [ -z "$$b" ]; then \
+	  echo "  FAIL     no compiler-rt builtins under $(1)/lib/clang/$(LLVM_MAJOR); it holds:" >&2; \
+	  find $(1)/lib/clang/$(LLVM_MAJOR) -maxdepth 3 2>/dev/null | sed 's/^/           /' >&2; \
+	  exit 1; \
+	fi; \
+	echo "  OK       libc++, libc++abi, libunwind, $$(basename $$b)"
+endef
+
+.PHONY: runtimes-info
+runtimes-info: $(RUNTIMES_STAMP) ## Show the cross-built runtimes and their sizes
+	@echo "  runtimes $(LLVM_RUNTIMES)"
+	@echo "  tree     $(RUNTIMES_BUILD)"
+	@for l in libc++.so.1 libc++abi.so.1 libunwind.so.1; do \
+	   p=$(SYSROOT)/usr/lib/$$l; \
+	   [ -e "$$p" ] && printf '  %-16s %s bytes\n' "$$l" "$$(wc -c < $$p | tr -d ' ')" || true; \
+	 done
+	@find $(SYSROOT)/usr/lib/clang/$(LLVM_MAJOR) -name 'libclang_rt.*' 2>/dev/null \
+	   | sed 's|^$(SYSROOT)/usr/|  builtins /usr/|' || true
+	@printf '  %s libc++ headers\n' \
+	   "$$(find $(SYSROOT)/usr/include/c++/v1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
+# Step 5c - the Objective-C runtime
+#
+# Objective-C and Objective-C++ are frontends clang already has; what it does
+# not have is a runtime to emit calls into. That runtime is not an LLVM
+# component at all - LLVM ships the compiler and nothing else - so it comes
+# from GNUstep's libobjc2, the modern non-fragile-ABI runtime with ARC.
+#
+# Three things about it that shape this step:
+#
+#   It requires clang. Its CMakeLists.txt refuses any other compiler outright
+#   (`if (NOT "${CMAKE_C_COMPILER_ID}" MATCHES Clang*)`), because the ABI it
+#   implements is one only clang emits. The cross GCC that builds everything
+#   else here cannot build it, so this is the one step that needs a host clang
+#   able to target aarch64 musl - HOST_CLANG, asserted before it is used.
+#
+#   It carries its own blocks runtime (EMBEDDED_BLOCKS_RUNTIME, on by default),
+#   so -fblocks needs nothing further.
+#
+#   It links against libgcc rather than compiler-rt, unlike everything the
+#   shipped clang will emit. A host clang looks for compiler-rt in *its own*
+#   resource directory, not in the sysroot, so pointing it at the builtins
+#   cross-built in step 5b would mean overriding -resource-dir and dragging in
+#   that clang's builtin headers as well. libgcc_s.so.1 is on the card anyway -
+#   the toolchain binaries themselves need it - and both unwinders implement the
+#   same ABI, so this is a wart rather than a defect. Ways out, in order of
+#   sanity: build libobjc2 with the clang from step 5 under an emulator, or
+#   construct a resource-dir shim holding our builtins and the host clang's
+#   headers.
+#
+# GNUSTEP_INSTALL_TYPE is pinned to NONE so the layout is plain /usr/lib and
+# /usr/include; left alone, libobjc2 asks gnustep-config where to install and
+# would land somewhere else entirely on a developer machine that has GNUstep.
+# ---------------------------------------------------------------------------
+
+# libobjc2 publishes no release assets, so this is GitHub's generated archive of
+# the tag. Those are *not* guaranteed byte-stable - GitHub has changed its gzip
+# settings before and invalidated every checksum pinned this way - so a verify
+# failure here may mean the archive was regenerated rather than that anything is
+# wrong. Check the contents before rewriting checksums/, and note that the tag
+# itself is immutable even when the tarball around it is not. There are no
+# submodules, so the archive is complete.
+OBJC2_VERSION ?= 2.3
+OBJC2_ARCHIVE  = libobjc2-$(OBJC2_VERSION).tar.gz
+OBJC2_URL      = https://github.com/gnustep/libobjc2/archive/refs/tags/v$(OBJC2_VERSION).tar.gz
+OBJC2_SUMS     = $(CHECKSUMS)/libobjc2-$(OBJC2_VERSION).sha256
+
+DL_OBJC2   := $(DL_DIR)/libobjc2
+OBJC2_DIR  := $(BUILD_DIR)/libobjc2
+OBJC2_SRC   = $(OBJC2_DIR)/libobjc2-$(OBJC2_VERSION)
+OBJC2_BUILD = $(OBJC2_DIR)/build
+OBJC2_LOG   = $(OBJC2_DIR)/build.log
+OBJC2_STAMP = $(OBJC2_DIR)/.installed
+
+# The ABI the shipped clang will emit by default, written into its config file
+# in step 6. libobjc2 2.3 implements the 2.2 ABI; clang parses the version
+# generically, so a newer runtime does not need a newer clang.
+OBJC_RUNTIME ?= gnustep-2.2
+
+# A clang on *this* machine that can emit aarch64 ELF. On Debian that is the
+# clang package; on macOS, Apple's clang can usually do it, and Homebrew's
+# (brew install llvm) certainly can - point HOST_CLANG at it if the assertion
+# below fails.
+HOST_CLANG   ?= clang
+HOST_CLANGXX ?= $(HOST_CLANG)++
+
+# libgcc.a and libgcc_s.so.1 live in the toolchain, in two different
+# directories, and both are asked for by name rather than guessed at - the same
+# -print-file-name idiom the rest of this Makefile uses.
+TC_LIBGCC_DIR = $(abspath $(dir $(shell $(CROSS)gcc -print-libgcc-file-name)))
+OBJC2_LDFLAGS = --ld-path=$(CROSS)ld -L$(TC_LIBGCC_DIR) $(CROSS_LDFLAGS) \
+                -L$(abspath $(SYSROOT))/usr/lib
+
+OBJC2_CFG := $(OBJC2_DIR)/.config
+OBJC2_SIG  = $(OBJC2_VERSION)|$(LLVM_TRIPLE)|$(MUSL_VERSION)|$(TC_VENDOR)|$(TC_VERSION)|$(CROSS_COMPILE)|$(HOST_CLANG)
+$(eval $(call config_stamp_rule,$(OBJC2_CFG),$(OBJC2_SIG)))
+
+OBJC2_CMAKE_FLAGS = \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_SYSTEM_NAME=Linux \
+  -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+  -DCMAKE_SYSROOT=$(abspath $(SYSROOT)) \
+  -DCMAKE_C_COMPILER=$(HOST_CLANG) \
+  -DCMAKE_CXX_COMPILER=$(HOST_CLANGXX) \
+  -DCMAKE_ASM_COMPILER=$(HOST_CLANG) \
+  -DCMAKE_C_COMPILER_TARGET=$(LLVM_TRIPLE) \
+  -DCMAKE_CXX_COMPILER_TARGET=$(LLVM_TRIPLE) \
+  -DCMAKE_ASM_COMPILER_TARGET=$(LLVM_TRIPLE) \
+  -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+  -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+  -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+  -DCMAKE_INSTALL_PREFIX=/usr \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_CXX_FLAGS=-stdlib=libc++ \
+  "-DCMAKE_EXE_LINKER_FLAGS=$(OBJC2_LDFLAGS)" \
+  "-DCMAKE_SHARED_LINKER_FLAGS=$(OBJC2_LDFLAGS)" \
+  "-DCMAKE_MODULE_LINKER_FLAGS=$(OBJC2_LDFLAGS)" \
+  -DGNUSTEP_INSTALL_TYPE=NONE \
+  -DBUILD_STATIC_LIBOBJC=OFF \
+  -DENABLE_OBJCXX=ON \
+  -DTESTS=OFF
+
+.PHONY: objc-runtime
+objc-runtime: $(OBJC2_STAMP) ## Cross-build the GNUstep Objective-C runtime
+	@echo "  READY    libobjc2 $(OBJC2_VERSION) -> $(SYSROOT)/usr/lib"
+
+$(OBJC2_STAMP): $(RUNTIMES_STAMP) $(OBJC2_CFG) Makefile
+	@$(call require_build_tools)
+	@$(call assert_cross_compiler)
+	@$(call assert_host_clang)
+	@test -f "$$($(CROSS)gcc -print-libgcc-file-name)" || { \
+	   echo "  FAIL     libgcc.a not found in the toolchain; libobjc2 links against it" >&2; \
+	   exit 1; }
+	@mkdir -p $(DL_OBJC2) $(OBJC2_DIR) $(CHECKSUMS)
+	@if [ ! -f $(DL_OBJC2)/$(OBJC2_ARCHIVE) ]; then \
+	   echo "  FETCH    $(OBJC2_ARCHIVE)"; \
+	   $(CURL) -o $(DL_OBJC2)/$(OBJC2_ARCHIVE).part "$(OBJC2_URL)"; \
+	   mv -f $(DL_OBJC2)/$(OBJC2_ARCHIVE).part $(DL_OBJC2)/$(OBJC2_ARCHIVE); \
+	 fi
+	@if [ -f $(OBJC2_SUMS) ]; then \
+	   echo "  VERIFY   $(OBJC2_ARCHIVE)"; \
+	   ( cd $(DL_OBJC2) && $(SHA256) --check --quiet $(abspath $(OBJC2_SUMS)) ) || { \
+	     echo "  FAIL     $(OBJC2_ARCHIVE) does not match $(OBJC2_SUMS)" >&2; exit 1; }; \
+	 else \
+	   ( cd $(DL_OBJC2) && $(SHA256) $(OBJC2_ARCHIVE) ) > $(OBJC2_SUMS); \
+	   echo "  RECORD   $(OBJC2_SUMS) - first fetch of this version, commit it"; \
+	 fi
+	@echo "  UNPACK   $(OBJC2_ARCHIVE)"
+	@rm -rf $(OBJC2_SRC)
+	@tar -xf $(DL_OBJC2)/$(OBJC2_ARCHIVE) -C $(OBJC2_DIR)
+	@echo "  CONFIG   libobjc2 $(OBJC2_VERSION) (log: $(OBJC2_LOG))"
+	@$(SCRUB_ENV) cmake -G Ninja -S $(OBJC2_SRC) -B $(OBJC2_BUILD) \
+	   $(OBJC2_CMAKE_FLAGS) > $(OBJC2_LOG) 2>&1 || { \
+	   tail -40 $(OBJC2_LOG) >&2; \
+	   echo "  FAIL     configure (full log: $(OBJC2_LOG))" >&2; exit 1; }
+	@echo "  BUILD    libobjc2 (-j$(JOBS))"
+	@$(SCRUB_ENV) cmake --build $(OBJC2_BUILD) --parallel $(JOBS) \
+	   >> $(OBJC2_LOG) 2>&1 || { \
+	   tail -40 $(OBJC2_LOG) >&2; \
+	   echo "  FAIL     build (full log: $(OBJC2_LOG))" >&2; exit 1; }
+	@echo "  INSTALL  libobjc2 -> $(SYSROOT)"
+	@DESTDIR=$(abspath $(SYSROOT)) $(SCRUB_ENV) cmake --install $(OBJC2_BUILD) \
+	   >> $(OBJC2_LOG) 2>&1 || { \
+	   tail -30 $(OBJC2_LOG) >&2; \
+	   echo "  FAIL     install (full log: $(OBJC2_LOG))" >&2; exit 1; }
+	@$(call assert_objc_runtime,$(abspath $(SYSROOT))/usr)
+	@touch $@
+
+# The one tool this build needs that is neither downloaded nor built here, so
+# it is checked before it is used rather than failing 200 lines into a CMake
+# log. Apple's clang is not guaranteed to emit Linux ELF on every release,
+# which is exactly what this catches.
+define assert_host_clang
+	set -e; \
+	for c in $(HOST_CLANG) $(HOST_CLANGXX); do \
+	  command -v "$$c" >/dev/null 2>&1 || { \
+	    echo "  FAIL     $$c not found - libobjc2 can only be built by clang" >&2; \
+	    echo "           (Debian: apt install clang, macOS: brew install llvm," >&2; \
+	    echo "            then HOST_CLANG=/opt/homebrew/opt/llvm/bin/clang)" >&2; \
+	    exit 1; }; \
+	done; \
+	t=$$(mktemp -d); \
+	printf 'int probe(void){return 0;}\n' > $$t/probe.c; \
+	if ! $(HOST_CLANG) --target=$(LLVM_TRIPLE) --sysroot=$(abspath $(SYSROOT)) \
+	     -c $$t/probe.c -o $$t/probe.o 2> $$t/err; then \
+	  echo "  FAIL     $(HOST_CLANG) cannot compile for $(LLVM_TRIPLE):" >&2; \
+	  sed 's/^/           /' $$t/err >&2; rm -rf $$t; exit 1; \
+	fi; \
+	if ! $(CROSS)readelf -h $$t/probe.o | grep -q AArch64; then \
+	  echo "  FAIL     $(HOST_CLANG) produced something that is not aarch64" >&2; \
+	  rm -rf $$t; exit 1; \
+	fi; \
+	rm -rf $$t
+endef
+
+# $(1) the usr/ prefix to look under.
+define assert_objc_runtime
+	set -e; \
+	p=$$(find $(1)/lib -maxdepth 1 -name 'libobjc.so*' ! -type l -print | sed -n '1p'); \
+	[ -n "$$p" ] || { echo "  FAIL     libobjc.so was not installed into $(1)/lib" >&2; exit 1; }; \
+	$(CROSS)readelf -h "$$p" | grep -q AArch64 \
+	  || { echo "  FAIL     $$(basename $$p) is not aarch64" >&2; exit 1; }; \
+	[ -f $(1)/include/objc/runtime.h ] \
+	  || { echo "  FAIL     objc headers are missing from $(1)/include/objc" >&2; exit 1; }; \
+	echo "  OK       $$(basename $$p), objc headers, blocks runtime included"
+endef
+
+.PHONY: objc-runtime-info
+objc-runtime-info: $(OBJC2_STAMP) ## Show the Objective-C runtime that will ship
+	@echo "  libobjc2 $(OBJC2_VERSION)"
+	@echo "  abi      $(OBJC_RUNTIME)"
+	@echo "  built by $(HOST_CLANG)"
+	@for f in $$(find $(SYSROOT)/usr/lib -maxdepth 1 -name 'libobjc.so*' ! -type l); do \
+	   printf '  %-16s %s bytes\n' "$$(basename $$f)" "$$(wc -c < $$f | tr -d ' ')"; \
+	 done
+	@printf '  %s objc headers\n' \
+	   "$$(find $(SYSROOT)/usr/include/objc -type f 2>/dev/null | wc -l | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
 # Step 6 - stage the install tree
 #
 # `cmake --install` under DESTDIR, so the tree is laid out exactly as it will
 # sit on the device (prefix /usr) without anything being written outside
-# build/. LLVM_INSTALL_TOOLCHAIN_ONLY already keeps the development-only
-# material out; what remains is stripping, and adding the two C++ runtime
-# libraries that the toolchain owns and the sysroot does not.
+# build/. Three build trees install into the same staged tree - the compiler
+# from step 5, the runtimes from 5b and the Objective-C runtime from 5c - and
+# LLVM_INSTALL_TOOLCHAIN_ONLY already keeps the development-only material out.
+# What remains is stripping, the two GCC runtime libraries that the toolchain
+# owns and the sysroot does not, and the clang config file that gives the
+# on-device driver its Objective-C ABI without anyone passing a flag.
+#
+# The GCC pair still ships even though user code now defaults to compiler-rt
+# and libc++: the clang binary itself was built by GCC and does not start
+# without them.
 #
 # libc.so is deliberately *not* staged: musl is the device's, from rootfs, and
 # shipping a second copy is how two musls end up on one card.
@@ -811,10 +1188,10 @@ stage: $(STAGE_STAMP) ## Install, strip and stage the toolchain for the device
 	@echo "  READY    staged $$(du -sh $(STAGE_DIR) | cut -f1) -> $(STAGE_DIR)"
 
 STAGE_CFG := $(BUILD_DIR)/.stage-config
-STAGE_SIG  = $(LLVM_VERSION)|$(SHIP_BINARIES)|$(WITH_LIBCLANG)|$(CXX_RUNTIME_LIBS)
+STAGE_SIG  = $(LLVM_VERSION)|$(SHIP_BINARIES)|$(WITH_LIBCLANG)|$(CXX_RUNTIME_LIBS)|$(LLVM_RUNTIMES)|$(OBJC2_VERSION)|$(OBJC_RUNTIME)|$(CLANG_CFG_STAGE)
 $(eval $(call config_stamp_rule,$(STAGE_CFG),$(STAGE_SIG)))
 
-$(STAGE_STAMP): $(TARGET_STAMP) $(STAGE_CFG) Makefile
+$(STAGE_STAMP): $(TARGET_STAMP) $(RUNTIMES_STAMP) $(OBJC2_STAMP) $(STAGE_CFG) Makefile
 	@$(call require_build_tools)
 	@rm -rf $(STAGE_DIR)
 	@mkdir -p $(STAGE_DIR)/usr/lib
@@ -823,12 +1200,23 @@ $(STAGE_STAMP): $(TARGET_STAMP) $(STAGE_CFG) Makefile
 	   > $(STAGE_LOG) 2>&1 || { \
 	   tail -30 $(STAGE_LOG) >&2; \
 	   echo "  FAIL     install (full log: $(STAGE_LOG))" >&2; exit 1; }
+	@echo "  INSTALL  runtimes + objc runtime"
+	@for b in $(RUNTIMES_BUILD) $(OBJC2_BUILD); do \
+	   DESTDIR=$(abspath $(STAGE_DIR)) $(SCRUB_ENV) cmake --install $$b \
+	     >> $(STAGE_LOG) 2>&1 || { \
+	     tail -30 $(STAGE_LOG) >&2; \
+	     echo "  FAIL     install $$b (full log: $(STAGE_LOG))" >&2; exit 1; }; \
+	 done
 	@echo "  RUNTIME  $(CXX_RUNTIME_LIBS)"
 	@for l in $(CXX_RUNTIME_LIBS); do \
 	   p=$$($(CROSS)gcc -print-file-name=$$l); \
 	   case "$$p" in /*) ;; *) echo "  FAIL     $$l not found in the toolchain" >&2; exit 1;; esac; \
 	   cp -L "$$p" $(STAGE_DIR)/usr/lib/$$l; \
 	 done
+	@echo "  CONFIG   $(CLANG_CFG_STAGE)/$(LLVM_TRIPLE).cfg (-fobjc-runtime=$(OBJC_RUNTIME))"
+	@mkdir -p $(STAGE_DIR)/$(CLANG_CFG_STAGE)
+	@printf '%s\n' '-fobjc-runtime=$(OBJC_RUNTIME)' \
+	   > $(STAGE_DIR)/$(CLANG_CFG_STAGE)/$(LLVM_TRIPLE).cfg
 	@$(call prune_stage)
 	@$(call strip_stage)
 	@touch $@
@@ -901,7 +1289,33 @@ stage-check: $(STAGE_STAMP) ## Verify the staged tree is aarch64 and self-contai
 	   done; \
 	   echo "  OK       $$b aarch64, musl loader, closure complete"; \
 	 done
+	@$(call assert_runtimes,$(STAGE_DIR)/usr)
+	@$(call assert_objc_runtime,$(STAGE_DIR)/usr)
+	@$(call assert_language_support)
 	@echo "  READY    staged tree is self-contained apart from musl"
+
+# What each language needs in order to get past the compile, over and above a
+# clang that can parse it. This is a layout check, not a compile: it says the
+# pieces are on the card in the places the driver looks, not that a program
+# built with them runs. Only the device, or an emulator, can say that.
+define assert_language_support
+	set -e; \
+	c=$(STAGE_DIR)/$(CLANG_CFG_STAGE)/$(LLVM_TRIPLE).cfg; \
+	[ -f "$$c" ] \
+	  || { echo "  FAIL     no clang config file at $$c - the shipped clang was" >&2; \
+	       echo "           built to read $(CLANG_CFG_DIR)/$(LLVM_TRIPLE).cfg" >&2; exit 1; }; \
+	grep -q -- '-fobjc-runtime=' "$$c" \
+	  || { echo "  FAIL     $$c does not set an Objective-C runtime" >&2; exit 1; }; \
+	[ -f $(STAGE_DIR)/usr/lib/clang/$(LLVM_MAJOR)/include/stddef.h ] \
+	  || { echo "  FAIL     clang's builtin headers are missing - C cannot compile" >&2; exit 1; }; \
+	[ -f $(STAGE_DIR)/usr/include/c++/v1/vector ] \
+	  || { echo "  FAIL     no libc++ headers - C++ cannot compile" >&2; exit 1; }; \
+	[ -f $(STAGE_DIR)/usr/include/objc/runtime.h ] \
+	  || { echo "  FAIL     no objc headers - Objective-C cannot compile" >&2; exit 1; }; \
+	[ -f $(STAGE_DIR)/usr/include/Block.h ] \
+	  || echo "  WARN     no Block.h staged; -fblocks will not compile"; \
+	echo "  OK       C, C++, Objective-C and Objective-C++ have their headers and runtimes"
+endef
 
 # ---------------------------------------------------------------------------
 # Step 7 - the release asset
@@ -987,7 +1401,13 @@ help: ## Show this help
 	@printf "  %-18s %s\n" \
 	  "LLVM_VERSION"  "upstream LLVM release (default $(LLVM_VERSION))" \
 	  "LLVM_PROJECTS" "what to build (default $(LLVM_PROJECTS))" \
+	  "LLVM_RUNTIMES" "target runtimes (default $(LLVM_RUNTIMES))" \
 	  "LLVM_TARGETS"  "backends to enable (default $(LLVM_TARGETS))" \
+	  "OBJC2_VERSION" "GNUstep Objective-C runtime (default $(OBJC2_VERSION))" \
+	  "OBJC_RUNTIME"  "Objective-C ABI the shipped clang defaults to (default $(OBJC_RUNTIME))" \
+	  "HOST_CLANG"    "clang on this machine, for libobjc2 (default $(HOST_CLANG))" \
+	  "CLANG_RTLIB"   "shipped clang's default rtlib (default $(CLANG_RTLIB))" \
+	  "CLANG_CXX_STDLIB" "shipped clang's default C++ library (default $(CLANG_CXX_STDLIB))" \
 	  "MUSL_VERSION"  "target musl - must match what rootfs ships (default $(MUSL_VERSION))" \
 	  "SHIP_BINARIES" "allowlist of what lands in usr/bin" \
 	  "WITH_LIBCLANG" "also ship libclang.so, the 41 MiB C API (default $(WITH_LIBCLANG))" \

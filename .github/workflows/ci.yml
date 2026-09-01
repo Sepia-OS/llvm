@@ -67,11 +67,16 @@ jobs:
       # fails as "No CMAKE_C_COMPILER could be found", which reads like a broken
       # CMake invocation rather than a missing package. A development machine
       # never shows this - macOS always has Apple clang.
+      #
+      # clang is here for step 5c alone: libobjc2's CMakeLists refuses any
+      # compiler that is not clang, because the Objective-C ABI it implements is
+      # one only clang emits. It is used to cross-compile, so any reasonably
+      # recent clang with the AArch64 backend will do - Debian's has it.
       - name: Install build tools
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            make cmake ninja-build gcc g++ python3 git curl ca-certificates xz-utils
+            make cmake ninja-build gcc g++ clang python3 git curl ca-certificates xz-utils
 
       - uses: actions/checkout@v5
 
@@ -113,6 +118,15 @@ jobs:
       - name: Cross-build clang and lld
         run: make llvm
 
+      # Step 5b. Without these the shipped clang compiles and then cannot link:
+      # its driver asks for builtins and a C++ library that would not be there.
+      - name: Cross-build the LLVM runtimes
+        run: make runtimes
+
+      # Step 5c. The one step built by clang rather than by the cross GCC.
+      - name: Cross-build the Objective-C runtime
+        run: make objc-runtime
+
       # Step 6.
       - name: Stage what ships
         run: make stage
@@ -129,7 +143,9 @@ jobs:
         run: make dist
 
       - name: What was built
-        run: make sources-info sysroot-info tablegen-info llvm-info stage-info dist-info
+        run: |
+          make sources-info sysroot-info tablegen-info llvm-info \
+               runtimes-info objc-runtime-info stage-info dist-info
 
       # cmake and ninja are noisy and only interesting when they fail, so the
       # Makefile sends them to a log and surfaces the tail. The full logs are
@@ -143,5 +159,7 @@ jobs:
             build/*.log
             build/host/build.log
             build/target/build.log
+            build/runtimes/build.log
+            build/libobjc2/build.log
             build/musl/*/build.log
           if-no-files-found: ignore

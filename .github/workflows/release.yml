@@ -188,7 +188,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            make cmake ninja-build gcc g++ python3 git curl ca-certificates xz-utils
+            make cmake ninja-build gcc g++ clang python3 git curl ca-certificates xz-utils
 
       # The release branch, not the dispatched ref: this is the whole point of
       # having branched.
@@ -249,6 +249,8 @@ jobs:
             build/*.log
             build/host/build.log
             build/target/build.log
+            build/runtimes/build.log
+            build/libobjc2/build.log
             build/musl/*/build.log
           if-no-files-found: ignore
 
