@@ -904,6 +904,61 @@ stage-check: $(STAGE_STAMP) ## Verify the staged tree is aarch64 and self-contai
 	@echo "  READY    staged tree is self-contained apart from musl"
 
 # ---------------------------------------------------------------------------
+# Step 7 - the release asset
+#
+# The staged tree, tarred and compressed: exactly what rootfs unpacks into the
+# root filesystem. Sibling repositories consume each other's *published
+# releases* rather than each other's build trees, so this is the supported way
+# out of here - nothing should read build/ across the filesystem.
+#
+# What ships is LLVM and nothing else. libstdc++.so.6 and libgcc_s.so.1 are in
+# there because the linkage is dynamic and clang cannot run without them, and
+# nothing else provides them; musl is emphatically *not*, because the device's
+# libc comes from rootfs and a second copy on the card is how two libcs end up
+# disagreeing. That is a property of the staged tree rather than of this
+# recipe, so it is asserted here rather than assumed.
+# ---------------------------------------------------------------------------
+
+# Set by the release workflow so the published file names the release it came
+# from; empty for a local build, which names the LLVM version alone.
+DIST_TAG   ?=
+DIST_ASSET  = sepiaos-llvm-$(LLVM_VERSION)-aarch64-musl$(if $(DIST_TAG),-$(DIST_TAG)).tar.xz
+DIST_SUMS  := SHA256SUMS
+
+.PHONY: dist
+dist: $(STAGE_STAMP) ## Pack the staged tree into dist/ as a release asset
+	@$(call assert_no_libc)
+	@mkdir -p $(DIST_DIR)
+	@echo "  PACK     $(DIST_ASSET)"
+	@tar -C $(STAGE_DIR) -cf - usr \
+	   | xz -9 -T0 -c > $(DIST_DIR)/$(DIST_ASSET).part
+	@mv -f $(DIST_DIR)/$(DIST_ASSET).part $(DIST_DIR)/$(DIST_ASSET)
+	@( cd $(DIST_DIR) && $(SHA256) $(DIST_ASSET) > $(DIST_SUMS) )
+	@echo "  READY    $$(du -h $(DIST_DIR)/$(DIST_ASSET) | cut -f1) -> $(DIST_DIR)/$(DIST_ASSET)"
+
+# musl reaching the asset would be a packaging mistake with a long fuse: it
+# would install over rootfs's own libc and its loader, and the mismatch would
+# only show up as something odd at runtime on the device.
+define assert_no_libc
+	set -e; \
+	found=$$(find $(STAGE_DIR) \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print); \
+	if [ -n "$$found" ]; then \
+	  echo "  FAIL     musl is in the staged tree; only LLVM ships:" >&2; \
+	  printf '           %s\n' $$found >&2; exit 1; \
+	fi; \
+	echo "  OK       LLVM only - no libc, no loader"
+endef
+
+.PHONY: dist-info
+dist-info: ## Show the packed asset and its digest
+	@test -f $(DIST_DIR)/$(DIST_ASSET) \
+	  || { echo "No $(DIST_DIR)/$(DIST_ASSET); run 'make dist' first." >&2; exit 1; }
+	@echo "  asset    $(DIST_DIR)/$(DIST_ASSET)"
+	@du -h $(DIST_DIR)/$(DIST_ASSET) | sed 's/^/  size     /' | cut -f1,2
+	@sed 's/^/  sha256   /' $(DIST_DIR)/$(DIST_SUMS)
+	@echo "  contents $$(tar -tf $(DIST_DIR)/$(DIST_ASSET) | wc -l | tr -d ' ') entries under usr/"
+
+# ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
 
@@ -938,4 +993,5 @@ help: ## Show this help
 	  "WITH_LIBCLANG" "also ship libclang.so, the 41 MiB C API (default $(WITH_LIBCLANG))" \
 	  "TC_VERSION"    "cross-toolchain release (default $(TC_VERSION))" \
 	  "CROSS_COMPILE" "use a musl cross-toolchain you already have" \
-	  "JOBS"          "parallelism for the target builds (default $(JOBS))"
+	  "JOBS"          "parallelism for the target builds (default $(JOBS))" \
+	  "DIST_TAG"      "release tag to name the packed asset after (default: none)"

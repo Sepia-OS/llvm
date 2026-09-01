@@ -1,0 +1,140 @@
+name: CI
+
+# Every commit on every branch, every pull request against main, and the push
+# that lands when a pull request is merged into main.
+#
+# Tag pushes deliberately do not match: `branches:` never matches a tag ref, so
+# cutting a release cannot start a second pipeline for the commit it just built.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Supersede the previous run for the same branch or PR. That matters more here
+# than in the sibling repositories: a superseded run is hours of runner time,
+# not seconds. A branch that also has an open PR gets one run per event in two
+# separate groups, so neither can cancel the other's checks out from under
+# branch protection.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # The whole build, on every commit: fetch and prove the cross-compiler, build
+  # the musl sysroot, build the host tablegen tools, cross-build clang and lld,
+  # stage what ships and pack it.
+  #
+  # This is a long job - the target build alone is a couple of hours on a
+  # four-core hosted runner under `-j4`. It is one job rather than several
+  # because every step after the first depends on the tree the previous one
+  # left behind, and passing a multi-gigabyte build tree between jobs would
+  # cost more than rebuilding it.
+  #
+  # `release.yml` is triggered by hand, but it looks for a successful run of
+  # this workflow on the commit being released and refuses to publish without
+  # one - so this job is the gate a release passes.
+  # -------------------------------------------------------------------------
+  build:
+    name: cross-build llvm
+    runs-on: ubuntu-latest
+    # The hard ceiling on a hosted runner is 6 hours, after which the job is
+    # cancelled with no diagnosis. Stopping just short of it means the logs
+    # below are still uploaded.
+    timeout-minutes: 350
+    # The same container the sibling repositories build in, and the one steps 1
+    # and 3 were verified in. Releases are cut on Linux because the
+    # cross-compiler - and therefore the output - differs by build host, so CI
+    # builds on the host that will cut the release.
+    container: debian:trixie-slim
+    steps:
+      # Before checkout on purpose: without git in the container,
+      # actions/checkout silently falls back to downloading a tarball.
+      #
+      # cmake and ninja are new to SepiaOS - neither sibling repository needs
+      # them. python3 is LLVM's own build-time requirement, not this repo's.
+      # xz-utils unpacks the toolchain and the LLVM tarball, and packs the
+      # release asset.
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            make cmake ninja-build python3 git curl ca-certificates xz-utils
+
+      - uses: actions/checkout@v5
+
+      # Step 1. bootlin's Linux-hosted, musl-targeting toolchain; messense
+      # publishes darwin-hosted builds only, which is why the vendor differs
+      # from the developer's machine.
+      - name: Fetch the cross-toolchain
+        run: make toolchain
+
+      # The claim the whole design rests on: a gnu-targeting toolchain cannot
+      # build C++ against musl at all, so this is checked rather than assumed,
+      # and checked before anything expensive runs.
+      - name: Prove it builds C++ against musl
+        run: make toolchain-check
+
+      # Step 2.
+      - name: Download the LLVM sources
+        run: make sources
+
+      - name: Check the sources against the pinned digest
+        run: make verify-downloads
+
+      # Step 3. musl.libc.org is unreliable from a container - four consecutive
+      # single-shot fetches failed when this was measured - which is why the
+      # Makefile's curl carries --retry-all-errors.
+      - name: Build the musl sysroot
+        run: make sysroot
+
+      - name: Prove C++ links dynamically against it
+        run: make sysroot-check
+
+      # Step 4. Native binaries, executed here as part of the step: a tablegen
+      # built for the wrong machine is invisible until the target build tries
+      # to run it.
+      - name: Build the host tablegen tools
+        run: make tablegen
+
+      # Step 5. The long one.
+      - name: Cross-build clang and lld
+        run: make llvm
+
+      # Step 6.
+      - name: Stage what ships
+        run: make stage
+
+      # Reads the staged tree back: every binary aarch64, on the musl loader,
+      # with a complete shared-library closure.
+      - name: Verify the staged tree
+        run: make stage-check
+
+      # Step 7, run here too so the release path is exercised on every commit
+      # rather than for the first time during a release. The asset is not
+      # uploaded - it is ~60 MiB per run and `release.yml` builds its own.
+      - name: Pack the release asset
+        run: make dist
+
+      - name: What was built
+        run: make sources-info sysroot-info tablegen-info llvm-info stage-info dist-info
+
+      # cmake and ninja are noisy and only interesting when they fail, so the
+      # Makefile sends them to a log and surfaces the tail. The full logs are
+      # what a failure actually needs.
+      - name: Upload the build logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-logs
+          path: |
+            build/*.log
+            build/host/build.log
+            build/target/build.log
+            build/musl/*/build.log
+          if-no-files-found: ignore

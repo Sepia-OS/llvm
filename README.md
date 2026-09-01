@@ -19,6 +19,7 @@ gmake tablegen          # host tablegen tools the cross-build needs
 gmake llvm              # cross-build clang and lld (the long one)
 gmake stage             # install, prune and strip what ships
 gmake stage-check       # aarch64, musl loader, complete library closure
+gmake dist              # pack it into dist/ as the release asset
 ```
 
 **On macOS, run `gmake`, not `make`.** `/usr/bin/make` is GNU Make 3.81, which
@@ -193,31 +194,77 @@ card. A clang install is larger than everything else on the card put together.
 
 ### 7. Publish
 
-The staged tree is compressed and published as a release asset, the way the
-`boot` repository publishes its card image. `rootfs` then consumes that
-release over the GitHub API and unpacks it into the root filesystem.
+`gmake dist` tars the staged `usr/` tree, compresses it with `xz -9` and writes
+its digest to `dist/SHA256SUMS` — the way the `boot` repository publishes its
+card image. `rootfs` then consumes that release over the GitHub API and unpacks
+it into the root filesystem.
+
+**What ships is LLVM and nothing else.** `libstdc++.so.6` and `libgcc_s.so.1`
+are in the asset because the linkage is dynamic, `clang` cannot start without
+them and nothing else on the device provides them. musl is not, and `dist`
+refuses to pack a tree that contains a `libc.so` or a loader: the device's libc
+comes from `rootfs`, and a second copy on the card is how two libcs end up
+disagreeing with each other.
+
+`DIST_TAG` names the file after the release it came from — the workflow passes
+the tag, so a local `gmake dist` produces
+`sepiaos-llvm-23.1.0-aarch64-musl.tar.xz` and a release produces
+`sepiaos-llvm-23.1.0-aarch64-musl-v1.0.0.tar.xz`.
 
 Reaching across the filesystem into `../llvm/build/` is deliberately not how
 this works: consuming a published release is what makes the sibling builds
 independently reproducible, and it is what allows them to run in CI.
 
+## Continuous integration
+
+Two workflows, both of which only call the `make` targets documented above, so
+any failure reproduces locally verbatim.
+
+| | |
+|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | every commit on every branch, and every pull request against `main` |
+| [`release.yml`](.github/workflows/release.yml) | manual, takes the version to release |
+
+**CI runs the whole build** — toolchain, sources, sysroot, host tablegen,
+cross-build, stage, `stage-check` and `dist` — on every commit. That is hours
+of runner time per push rather than the seconds the sibling repositories take,
+so a superseded run for the same branch is cancelled, and the job stops just
+short of the six-hour ceiling a hosted runner imposes so the build logs are
+still uploaded on the way out. It builds in `debian:trixie-slim` on Linux
+because the toolchain vendor, and therefore the binaries, differ by build host.
+
+**Releases are never automatic.** A manual dispatch takes the version; a gate
+job validates it, resolves `main`'s head and refuses a commit with no green CI
+run; `main` is branched to `rel-<version>` and the build runs *on that branch*,
+so the released commit still exists once `main` moves on. If the build fails,
+the branch is deleted again and the same version can be retried.
+
+**Only the newest release is kept.** Publishing deletes every release that came
+before it, and their tags with them — this repository ships one product, the
+current toolchain, and each asset is tens of megabytes. Nothing is deleted
+until there is a built asset to put in its place, and the commit each old
+release was built from stays reachable through its `rel-<version>` branch,
+which is never deleted.
+
 ## Status
 
-Steps 1 to 6 are implemented and verified end to end: `gmake stage` produces a
+Steps 1 to 7 are implemented and verified end to end: `gmake stage` produces a
 189 MiB tree holding `clang`, `lld`, twelve LLVM binutils equivalents and the
-two C++ runtime libraries, all aarch64, all linked against musl 1.2.6.
+two C++ runtime libraries, all aarch64, all linked against musl 1.2.6, and
+`gmake dist` packs it for release.
 
 Both hosts are covered. Steps 1 and 3 have been verified on Linux/x86_64 in
 `debian:trixie-slim` — the container the sibling repositories use for CI —
-using the bootlin toolchain, producing the same musl 1.2.6 sysroot.
-
-Step 7 (publish) is not yet written, and there is no CI workflow.
+using the bootlin toolchain, producing the same musl 1.2.6 sysroot. The
+container has not yet run steps 4 to 6 itself; the first CI run is what proves
+those, and `python3` is in the workflow's install list for LLVM's sake.
 
 ## Repository layout
 
 | | |
 |---|---|
 | `Makefile` | the entire build |
+| `.github/workflows/` | `ci.yml` (build on every commit) and `release.yml` (manual publish) |
 | `checksums/` | committed digests for the pinned upstream sources |
 | `downloads/` | fetched upstream artifacts; survive `gmake clean` |
 | `build/` | everything generated |

