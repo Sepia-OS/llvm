@@ -1,0 +1,50 @@
+### SepiaOS llvm build output ###
+build/
+downloads/
+dist/
+
+### Claude Code local settings (personal, not shared) ###
+.claude/settings.local.json
+
+### macOS ###
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+*.icloud
+
+### Linux ###
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+### VisualStudioCode ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.history/
+*.vsix
+.ionide
+
+# Deliberately NOT using the stock toptal C/C++ section here. Its `*.d`
+# prerequisite pattern also matches *directories* named `*.d`, which is how the
+# sibling rootfs repository silently failed to commit overlay/etc/init.d for
+# weeks. Everything this build generates already lives under build/ or
+# downloads/, so the object-file patterns bought nothing and cost that.

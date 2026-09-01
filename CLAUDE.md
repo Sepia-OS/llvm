@@ -1,0 +1,134 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Status
+
+**Steps 1 to 6 of [README.md](README.md) are implemented and verified end to end; step 7 is not written.** `main` still has **no commits at all** — nothing here has ever been committed — and no `origin` remote is configured. It should be `git@github.com:Sepia-OS/llvm.git`, following `Sepia-OS/boot` and `Sepia-OS/rootfs`.
+
+`gmake stage` produces a 189 MiB tree: `clang`, `lld`, twelve binutils equivalents, `clang-format`, the two C++ runtime libraries and clang's builtin headers — all aarch64, all against musl 1.2.6.
+
+| Target | |
+|---|---|
+| `gmake toolchain` | fetch + verify the musl-targeting cross-toolchain against upstream's digest |
+| `gmake toolchain-check` | compile and link C++ against musl, both ways — the gate the whole design rests on |
+| `gmake sources` | fetch + digest + unpack the pinned LLVM tarball; asserts the tree declares the pinned version |
+| `gmake sysroot` | build musl into `build/sysroot`, plus UAPI headers from the toolchain |
+| `gmake sysroot-check` | C++ links dynamically against it and points at the device's musl loader |
+| `gmake tablegen` | the three host tablegen binaries, each executed to prove it runs here |
+| `gmake llvm` | the cross-build; asserts the products are aarch64 on the musl loader |
+| `gmake stage` | install under `DESTDIR`, prune to `SHIP_BINARIES`, strip, add the runtime libs |
+| `gmake stage-check` | every staged binary aarch64, musl loader, **complete library closure** |
+| `*-info` / `verify-downloads` / `runtime-libs` / `clean` / `distclean` / `print-%` | the house-style accessories |
+
+Not yet written: release publishing (step 7) and any CI.
+
+Overriding a variable touches no file, so each expensive tree carries a `.config` signature stamp (`MUSL_SIG`, `HOST_SIG`, `TARGET_SIG`, `STAGE_SIG`) — `../boot`'s `CONFIG_SIG` idiom. Without it `gmake MUSL_VERSION=1.2.5 sysroot` reports "Nothing to be done" and leaves 1.2.6 in place. Verified both ways: an unchanged signature leaves the stamp's mtime alone, a changed one rewrites it. Note that `gmake -n` **cannot** test this — `FORCE` makes the stamp look permanently dirty under dry-run, so both cases look identical.
+
+**One build at a time.** Two `gmake` runs against this tree concurrently will race on `build/sysroot` (`cp: ... File exists` from `install_uapi_headers`) and corrupt the target tree mid-compile. That is a self-inflicted wound, not a Makefile defect, but it costs a long rebuild.
+
+One idiom worth knowing before editing a recipe: `.SHELLFLAGS` sets `-o pipefail`, so a pipeline ending in `grep -m1` or `head` exits early, SIGPIPEs its producer and **fails after printing the right answer** — a trailing `|| echo unknown` then fires too and you get both lines. `musl_version_of` in the Makefile reads in two steps and ends with `sed -n '1p'`, which consumes its input rather than closing the pipe.
+
+`.gitignore` and the Apache 2.0 `LICENSE` are in place. The `.gitignore` deliberately **omits** the stock toptal C/C++ section the siblings use: its `*.d` prerequisite pattern also matches *directories* named `*.d`, which is exactly how `../rootfs` silently failed to commit `overlay/etc/init.d/`. Everything this build generates is already under `build/` or `downloads/`, so those patterns bought nothing and cost that.
+
+## What This Repository Is For
+
+SepiaOS is an operating system for Raspberry Pi that reuses the kernel and firmware from Raspberry Pi OS; everything above the kernel is custom. Targets: Pi Zero 2 W, Pi 3, Pi 4, Pi 5, CM4, CM5.
+
+The three repositories are checked out side by side and opened together via [../SepiaOS.code-workspace](../SepiaOS.code-workspace):
+
+| | |
+|---|---|
+| [../boot](../boot) | the FAT boot partition — complete, released, CI'd. The closest model for what a SepiaOS repo looks like. |
+| [../rootfs](../rootfs) | the ext4 root filesystem: cross-toolchain, musl, busybox, kernel modules, bootable image. Complete. |
+| `.` (this repo) | LLVM for SepiaOS. Per `README.md`: *"The sources are downloaded and then a cross-build is done with the same toolchain from the repository rootfs."* |
+
+That one sentence is the entire specification. Both siblings have a long, prose-heavy `README.md` that the Makefile implements literally, step by step — `../rootfs/README.md` is the pattern to follow, and expanding this README into that shape is probably the real first task.
+
+## What Is Being Built
+
+**Decided: LLVM is cross-built to run *on* the Pi.** The product is aarch64 `clang`, `lld` and the LLVM tools, linked against the SepiaOS musl sysroot and installed into the root filesystem, so the device compiles for itself. The `rootfs` toolchain is the *means*; LLVM is the *product*. This is **not** a dev-host-hosted cross-compiler, and it does not replace the GCC toolchain `rootfs` downloads.
+
+Four things follow directly, and each is a decision to make before the first CMake invocation rather than after:
+
+- **The CMake configuration is the cross one**, not a native build: `CMAKE_SYSTEM_NAME=Linux`, a sysroot pointing at musl, and prebuilt native `LLVM_TABLEGEN`/`CLANG_TABLEGEN` because tablegen runs on the build host (see the last section). `LLVM_HOST_TRIPLE` describes where the compiler *runs*, which is now the Pi; set `LLVM_DEFAULT_TARGET_TRIPLE` to the SepiaOS target so the on-device clang needs no `--target`.
+- **The `rootfs` toolchain is ruled out — measured, not assumed.** Its `aarch64-unknown-linux-gnu` GCC **cannot compile C++ against a musl sysroot at all**. libstdc++ is coupled to glibc in its *headers*, so it fails long before the linker: `bits/os_defines.h` uses `__GLIBC_PREREQ`, and `bits/c++locale.h` needs glibc's `__locale_t`. Plain, `-static-libstdc++ -static-libgcc` and fully `-static` all fail identically, and none produce a binary. That works fine for C — which is all busybox needed — but LLVM is C++. So this repo takes the **musl variant of the same messense 15.2.0 release**, whose libstdc++ was built against musl. `gmake toolchain-check` is that claim checked, and it passes. Do not "simplify" this back to the toolchain `rootfs` uses.
+- **Decided: dynamic linking.** So `libstdc++.so.6` and `libgcc_s.so.1` are part of the product, not just of the build. They come from the cross-toolchain, they are not in the sysroot, and nothing in `../rootfs` provides them — so they travel inside *this* repository's release asset rather than becoming something `rootfs` has to know to install. `gmake runtime-libs` lists them with their paths and sizes.
+- **The sysroot's musl version is a cross-repo invariant.** The cross-toolchain bakes in musl **1.2.5**; `../rootfs` ships **1.2.6**; a dynamically linked clang has to run against whatever is actually on the device. So step 3 builds musl 1.2.6 into `build/sysroot` from source pinned by a checksum *copied from `rootfs`* (byte-identical source), and the LLVM build will point `--sysroot` there rather than at the toolchain's own. Verified by experiment: redirecting `--sysroot` swaps the libc **without** disturbing C++, because the C++ headers and libstdc++ resolve through the compiler's own search paths, outside any sysroot. **`../rootfs` resolves musl as "latest" by default**, so it can drift out from under this pin — when it moves, `MUSL_VERSION` and `checksums/musl-*.sha256` here must move with it. `gmake sysroot-info` prints the pinned version, the version actually built, and the toolchain's unused one side by side.
+- **musl is built here, not read out of `../rootfs/build/sysroot`.** Siblings consume each other's *published releases*, never each other's build trees — that is what keeps each repo buildable alone and in CI.
+- **Two toolchain vendors, because neither covers both hosts.** messense publishes darwin-hosted builds only; bootlin (Buildroot) publishes Linux-hosted builds only, x86_64 host only. macOS is therefore the development host and Linux the release host — the same split `../rootfs` uses, for the same reason. Both are fetched and digest-verified by one shared recipe; they differ only in `TC_PREFIX`, `TC_ARCHIVE`, `TC_URL` and `TC_SUMS`.
+- **`LLVM_TRIPLE` is the product's triple and is pinned, not inherited.** The vendors disagree — messense's compiler reports `aarch64-unknown-linux-musl`, bootlin's reports `aarch64-buildroot-linux-musl` — so `LLVM_HOST_TRIPLE` and `LLVM_DEFAULT_TARGET_TRIPLE` are set from `LLVM_TRIPLE` rather than from whatever built them. A clang whose default target depended on which machine cut the release would be a genuinely confusing artifact. Don't "simplify" this by deriving it from `-dumpmachine`.
+- **What ships is a release asset another repo consumes.** The house style is that a sibling takes a *published release* over the GitHub API rather than reaching across the filesystem — that is exactly how `rootfs` gets the boot partition. So this repo should publish an LLVM tarball and `rootfs` should grow a step that unpacks it into the image; nothing should read `../llvm/build/` directly.
+- **Size becomes a product constraint, not just a build one.** The SepiaOS userland today is musl plus busybox, and the image is deliberately sized to its contents so that first boot can grow it to fill the card. A clang/lld install dwarfs everything else on that card combined, so `LLVM_TARGETS_TO_BUILD=AArch64` alone, a curated project list, stripped binaries and no static archives are choices to make up front.
+
+## The Toolchain Contract With `../rootfs`
+
+All of the following was read out of `../rootfs/Makefile`, not from its documentation. The single most important fact:
+
+> **`rootfs` has no LLVM in it at all.** `clang`, `llvm`, `tblgen`, `cmake` and `ninja` appear nowhere in its Makefile, README or CLAUDE.md. Its "toolchain" is **GCC**. This repository introduces LLVM to SepiaOS for the first time.
+
+- **The cross-compiler differs by build host**, which is checked, not assumed — Arm publishes macOS builds only for bare-metal targets, and messense publishes darwin-hosted builds only:
+
+  | Host | Vendor | Default version | Triple |
+  |---|---|---|---|
+  | macOS | `messense/homebrew-macos-cross-toolchains` | 15.2.0 | `aarch64-unknown-linux-gnu` |
+  | Linux | Arm | 14.3.rel1 | `aarch64-none-linux-gnu` |
+
+  A consequence `rootfs` states outright: binaries built on macOS and on Linux are **not byte-identical**, so release builds are cut on Linux and macOS is the development host.
+- The GNU-targeting toolchain is chosen deliberately over the musl-targeting one messense also ships, because `rootfs` builds musl from source and a baked-in musl would make that step a no-op.
+- `CROSS_COMPILE` overrides the download entirely (`CROSS = $(or $(CROSS_COMPILE),$(TC_DIR)/bin/$(TC_TRIPLE)-)`), so a toolchain you already have can be used. Offer the same escape hatch here.
+- The toolchain is unpacked under `downloads/`, not `build/` — it is an immutable upstream artifact and ~1.5 GiB is too much to re-extract on every `clean`. It is deliberately **not** a prerequisite of anything, so editing a recipe never triggers a 600 MiB re-extract.
+- **The sysroot is `../rootfs/build/sysroot`**, and it is not a plain musl install: musl goes in via `DESTDIR`, and then the Linux UAPI headers are copied in from the cross-toolchain's own `-print-sysroot`, because musl installs libc headers and nothing else. The dynamic loader is `lib/ld-musl-aarch64.so.1`. Things are compiled against it with `$(CROSS)gcc --sysroot=<abs path>`.
+- That sysroot is a **build artifact of a sibling repo**, so decide deliberately how this repo gets one: rebuild musl here, consume a published `rootfs` release, or require `../rootfs` to be built first. `rootfs` faced the same question for the boot partition and answered it by consuming the sibling's *published release* over the GitHub API rather than reaching across the filesystem — that is the house style, and it is what makes CI possible.
+
+## Conventions To Inherit
+
+Both siblings are single-Makefile builds with the same shape. Match it rather than inventing:
+
+- **`gmake`, not `make`.** Both Makefiles hard-error on GNU Make < 4.0, because macOS's 3.81 compares timestamps only to the second and silently reuses stale outputs after a fast edit.
+- **Nothing needs root**, on macOS or Linux. `boot` routes all partition and FAT work through `mtools` specifically to keep it that way.
+- **Directory split:** `downloads/` (fetched upstream artifacts, survive `clean`), `build/` (everything generated), `dist/` (release assets), `checksums/` (committed manifests), `tools/` (things a person runs). `clean` drops `build/`; `distclean` also drops `downloads/`.
+- **Pinned upstream versions with committed checksums.** Upstream rarely publishes usable ones, so the repo records its own manifest and a `verify-*` target checks against it.
+- **A "latest" lookup is resolved once into a stamp file** and rewritten only when a signature changes (the `FORCE` + `cmp -s` idiom in both Makefiles). Resolution happens in the recipe, never at parse time, so `make help` never touches the network. `GITHUB_TOKEN` is honoured because the unauthenticated API allows 60 requests an hour.
+- **Variable overrides need a config signature.** A command-line override touches no file, so without a `CONFIG_SIG`-style stamp Make reports "Nothing to be done" and hands back a stale artifact.
+- **Target naming:** an aggregate goal (`musl`, `image`, …) plus `<thing>-info` (what version, from where, how big) and `<thing>-check` (re-read the artifact and assert it). Every aggregate goal ends with a `READY` line that prints whether or not anything was rebuilt — a satisfied phony goal otherwise prints nothing, which reads exactly like a broken target.
+- **`print-%`** exposes any variable to scripts and CI (`gmake -s print-IMAGE`). `boot`'s release workflow depends on it, which makes those variable names a CI contract.
+- **CI runs in `debian:trixie-slim`**, and installs build tools *before* `actions/checkout` — without `git` in the container, checkout silently degrades to a tarball download. Releases are **never automatic**: a manual `workflow_dispatch` takes a version string, a gate job refuses a commit with no green CI run, `main` is branched to `rel-<version>`, and a rollback job deletes the branch if the build fails. See [../boot/docs/CI.md](../boot/docs/CI.md).
+
+## The Two Build Trees
+
+A cross-build of LLVM is two CMake trees, not one, and confusing them is the main way this build goes wrong:
+
+| | `build/host` (step 4) | `build/target` (step 5) |
+|---|---|---|
+| compiler | the **host's** (Apple clang) | the musl cross-toolchain |
+| produces | `llvm-tblgen`, `llvm-min-tblgen`, `clang-tblgen` | `clang`, `lld`, `libLLVM`, `libclang-cpp` |
+| runs on | this machine, during the build | the Pi |
+
+- **`llvm-min-tblgen` is the one that is easy to miss.** It is a separate binary from `llvm-tblgen`, LLVM uses it to generate its earliest headers, and if it is absent from the host tree the cross-build quietly builds it *for the target* and then cannot execute it. Confirmed as a real target by grepping `build/host/build.ninja`, not assumed.
+- **Hand over the whole directory, not individual tools.** `LLVM_NATIVE_TOOL_DIR=build/host/bin` means "any tool you need to *run* during this build, take it from here". Naming only `LLVM_TABLEGEN` and `CLANG_TABLEGEN` covers the obvious two and leaves any other native helper to be built for the target and fail at exec time. Both are set anyway; the directory is what makes it robust.
+- **A cross-build succeeds just as happily having produced binaries for the wrong machine.** So both steps read their products back: step 4 executes each tablegen, step 5 asserts `clang` and `lld` are AArch64 ELF pointing at `ld-musl-aarch64.so.1`.
+- Size is controlled by `LLVM_BUILD_LLVM_DYLIB` + `LLVM_LINK_LLVM_DYLIB` + `CLANG_LINK_CLANG_DYLIB` (one shared library each instead of a static copy per tool) and `LLVM_INSTALL_TOOLCHAIN_ONLY` (no internal headers, static archives or build-time utilities). Both matter because this ships on an SD card beside a userland measured in megabytes.
+- Clang's default rtlib and C++ stdlib are left at **libgcc / libstdc++** deliberately: those are exactly the runtime libraries this build ships, so the on-device clang defaults to what is actually present.
+
+Both trees take `Makefile` as a prerequisite, per the house rule that editing a recipe rebuilds what is *built*. For the target tree that is cheap — an unchanged CMake configuration reconfigures as a no-op and ninja rebuilds nothing — but it does mean a Makefile edit re-runs the musl build (a minute or two).
+
+### Two things that bit, and would bite again
+
+- **The `gcc` driver cannot find libstdc++, and it only shows up ~4400 targets in.** libstdc++ lives in the *toolchain* (`<tc>/aarch64-unknown-linux-musl/lib64`), not in the sysroot. Most of LLVM is C++ and links with `g++`, which knows where its own C++ library is; a handful of targets are built from `.c` sources and link with `gcc`, which does not. Linking one of those against `libLLVM.so` then fails with a wall of `undefined reference to ...@GLIBCXX_3.4`. `libLLVM.so` itself is fine and *does* record `NEEDED libstdc++.so.6` — the failure is the executable link having nowhere to resolve it from. `CROSS_LDFLAGS` adds `-L` and `-Wl,-rpath-link` for that directory to every link, which settles it once rather than per-target. Don't diagnose this as "libLLVM is broken"; check `readelf -d` on it first.
+- **Reading a version string out of a binary portably is harder than it looks.** `strings` lives in binutils, which a slim CI image does not install — `debian:trixie-slim` has none, and the probe silently returned empty, which the assertion then reported as a version *mismatch*. The obvious replacement, `tr -c '[:print:]' '\n'`, is worse: BSD `tr` cannot read NUL bytes, so on macOS it yields nothing at all. `LC_ALL=C grep -a -o` works on both. Note the second-order lesson baked into `sysroot-info`: an unreadable probe and a genuine mismatch are different outcomes and must not share a message.
+- **`musl.libc.org` is unreliable from a CI container, and plain `--retry` does not save you.** Measured from `debian:trixie-slim`: four consecutive single-shot fetches of the musl tarball all failed, two with `curl: (35) TLS connect error: ... unexpected eof while reading` and two with connection timeouts. curl's `--retry` only retries what it classes as transient, and a TLS handshake failure is not on that list — so `--retry-all-errors` is load-bearing here, not decoration. With it, the same fetch succeeds. **`../rootfs` downloads musl from the same host without `--retry-all-errors`**, so its CI is exposed to exactly this; worth fixing there too.
+- **Homebrew's `CPPFLAGS` and `LDFLAGS` leak host paths into the cross build.** `brew` sets `CPPFLAGS=-I/opt/homebrew/opt/include` and `LDFLAGS=-L/opt/homebrew/opt/lib` in the developer's shell, and CMake reads `LDFLAGS` straight into `CMAKE_EXE_LINKER_FLAGS`, `CMAKE_SHARED_LINKER_FLAGS` and `CMAKE_MODULE_LINKER_FLAGS` — all three were observed carrying it in `build/target/CMakeCache.txt`, and `-L/opt/homebrew/opt/lib` appeared on real target link lines. Nothing broke, because nothing was found there; a host library that *was* found would have gone into a target binary silently. Every `cmake` invocation therefore runs under `SCRUB_ENV`, which unsets the six variables CMake and the compiler drivers read. This is not paranoia about a hypothetical — it was in the cache.
+
+## What LLVM Will Add That SepiaOS Has Not Needed
+
+Verified on this host, so these are additions to the project's dependency set, not to the machine: `cmake` 4.3.2, `ninja` 1.13.2 and Apple `clang` 21 are already installed, while neither sibling Makefile calls any of them. Both siblings needed nothing beyond `curl`, `git`, `jq`, `xz`, `tar` and `mtools`, so adding CMake and Ninja is a real change to the "required tools" line — and CI installs its own, so they belong in the workflow's `apt-get install` list too.
+
+Two consequences of cross-building LLVM specifically that shape the design:
+
+- **A cross-build needs native tablegen binaries first.** `llvm-tblgen` and `clang-tblgen` run on the *build* host during the build, so they must be compiled for the host and passed in via `-DLLVM_TABLEGEN=` / `-DCLANG_TABLEGEN=`. That means two build trees, not one. `../rootfs` has a precedent for exactly this shape — its `e2fsprogs` target builds `mke2fs`/`debugfs` for the host and `resize2fs` for the target.
+- **Scale.** LLVM sources and build trees dwarf anything in the siblings, whose whole download budget is tens of megabytes. This is what makes the `.gitignore`-first point above urgent, and it is worth deciding early whether to fetch release tarballs for selected projects rather than clone the monorepo.
+
+## Build Environment
+
+The user develops on macOS (`darwin`), currently on GNU Make 4.4.1 via `gmake`. Release builds belong on Linux, because the cross-compiler — and therefore the output — differs by build host.
