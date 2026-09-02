@@ -336,30 +336,26 @@ which is never deleted.
 
 ## Status
 
-Steps 1 to 6 were verified end to end on macOS **before** the runtimes were
-added: `gmake stage` produced a 189 MiB tree holding `clang`, `lld`, twelve LLVM
-binutils equivalents and the two C++ runtime libraries, all aarch64, all linked
-against musl 1.2.6.
+**All seven steps are implemented and green in CI**, in 2 h 06 m on a hosted
+runner. The build produces a 186 MiB staged tree — 9.4 MiB of binaries, 159 MiB
+of libraries, 17 MiB of headers — which packs to a **41 MiB** release asset:
 
-**Steps 5b and 5c, and the changes to 5 and 6 that go with them, have not been
-run yet** — not on macOS and not in CI. They are written from LLVM 23.1.0's own
-CMake options and clang's driver sources, and every one of them asserts its
-result rather than assuming it, but a build is the only thing that settles
-whether they work. Expect the first runs to find something.
+| | |
+|---|---|
+| `clang`, `lld`, 12 binutils equivalents | `usr/bin` |
+| `libc++.so.1` 1.5 MB, `libc++abi.so.1` 475 KB, `libunwind.so.1` 83 KB | `usr/lib` |
+| `libobjc.so.4.6` 256 KB | `usr/lib` |
+| compiler-rt builtins | `usr/lib/clang/23/lib/linux` |
+| 1689 libc++ headers, 22 objc headers | `usr/include` |
 
-What is verified about them so far: libobjc2 2.3's archive unpacks where the
-Makefile expects and its digest is recorded in `checksums/`; Apple clang 21
-emits aarch64 ELF for the musl triple, so `HOST_CLANG` needs no setting on
-macOS; every CMake option used exists in 23.1.0.
+`gmake stage-check` passes every assertion, ending with *"C, C++, Objective-C
+and Objective-C++ have their headers and runtimes"*.
 
-Steps 1 to 3 have been verified on Linux/x86_64 in `debian:trixie-slim` — the
-container CI uses — with the bootlin toolchain, producing the same musl 1.2.6
-sysroot. Step 4 needed `gcc`/`g++` added to the container, which is what the
-first CI run found.
-
-**Nothing here has been run on a Raspberry Pi.** `stage-check` proves the layout,
-not that the toolchain compiles a program on the device; that needs hardware or
-an emulator.
+**That is a layout proof, not a behavioural one.** Nothing has yet compiled a
+program *with* the shipped toolchain — `stage-check` says the pieces are where
+the driver looks, not that a program built with them runs. That needs a
+Raspberry Pi or an emulator, and until then "the four languages work" is a
+claim rather than a result.
 
 ## Repository layout
 
