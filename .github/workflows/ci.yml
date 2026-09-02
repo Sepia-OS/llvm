@@ -68,17 +68,37 @@ jobs:
       # CMake invocation rather than a missing package. A development machine
       # never shows this - macOS always has Apple clang.
       #
-      # clang is here for step 5c alone: libobjc2's CMakeLists refuses any
-      # compiler that is not clang, because the Objective-C ABI it implements is
-      # one only clang emits. It is used to cross-compile, so any reasonably
-      # recent clang with the AArch64 backend will do - Debian's has it.
+      # The clang that steps 5b and 5c need is installed after checkout instead,
+      # because which one is needed is a fact the Makefile owns.
       - name: Install build tools
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            make cmake ninja-build gcc g++ clang python3 git curl ca-certificates xz-utils
+            make cmake ninja-build gcc g++ python3 git curl ca-certificates xz-utils
 
       - uses: actions/checkout@v5
+
+      # Steps 5b and 5c compile libc++'s own headers and libobjc2, and both need
+      # a clang about as new as the LLVM being built. Measured, not assumed:
+      # GCC 14 fails on clang-only builtins (__is_unbounded_array and friends)
+      # and trixie's own clang 19 fails on `#pragma clang attribute` with
+      # __visibility__. apt.llvm.org publishes an exact-version clang for this
+      # distribution, and the version is read out of the Makefile so the two
+      # cannot drift apart.
+      #
+      # It goes into $GITHUB_ENV rather than onto one make line: HOST_CLANG is
+      # part of the runtimes' config signature, so a later step that omitted it
+      # would consider them stale and rebuild with a different compiler.
+      - name: Install a clang matching the pinned LLVM
+        run: |
+          major="$(make -s print-LLVM_MAJOR)"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /usr/share/keyrings/llvm.asc
+          echo "deb [signed-by=/usr/share/keyrings/llvm.asc] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-${major} main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends "clang-${major}"
+          echo "HOST_CLANG=clang-${major}" >> "$GITHUB_ENV"
+          "clang-${major}" --version | head -1
 
       # Step 1. bootlin's Linux-hosted, musl-targeting toolchain; messense
       # publishes darwin-hosted builds only, which is why the vendor differs

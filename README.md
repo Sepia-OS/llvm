@@ -171,15 +171,29 @@ C++ a standard library, and neither would be on the card.
 | `libcxxabi` | the Itanium C++ ABI: exceptions, RTTI, vtable layout. |
 | `libcxx` | the C++ standard library, headers included. |
 
-They are built with the **cross GCC**, not with a clang, which looks wrong and
-is deliberate. A clang bootstrap has a chicken-and-egg step — CMake's compiler
-check links a test program, which needs the builtins this build has not produced
-yet — and it would need a host clang that can target musl. The cross GCC has its
-own libgcc, links test programs on the first try, and is the same compiler,
-sysroot and flags step 5 already proved. libc++ supports being built by GCC.
-What matters is which runtime the *shipped clang defaults to*, and that is set
-in step 5 — `CLANG_RTLIB`, `CLANG_CXX_STDLIB` and `CLANG_UNWINDLIB`, which
-default to compiler-rt, libc++ and libunwind and can be set back to GCC's.
+They are built with a **host clang cross-targeting the device**, not with the
+cross GCC that builds everything else here. The first version of this step did
+use the cross GCC, and CI refuted it: LLVM 23's libc++ headers are written
+against clang builtins GCC 14 does not have — `__is_unbounded_array`,
+`__is_pointer`, `__builtin_operator_new`, `__decay`, `__add_lvalue_reference` —
+so libc++abi died about 1700 ninja steps in, with the errors *inside the libc++
+headers*. compiler-rt and libunwind build fine under GCC; libc++ is the one that
+cannot.
+
+The chicken-and-egg that made GCC attractive — CMake's compiler check links a
+test program, which wants builtins this build has not produced yet — is handled
+by pointing clang at the cross toolchain's own GCC installation: `--ld-path`,
+`-L`, and `--gcc-install-dir` so that clang can find `crtbegin`/`crtend`, which
+it otherwise looks for by triple, fails to locate, and passes to the linker as
+bare filenames it cannot resolve. The runtimes therefore link against libgcc for their own needs, while
+the *shipped clang* defaults to compiler-rt for user code. That default is set
+in step 5 — `CLANG_RTLIB`, `CLANG_CXX_STDLIB` and `CLANG_UNWINDLIB`, which can
+be set back to GCC's.
+
+**The host clang has to be about as new as the LLVM being built**, because this
+step compiles libc++'s own headers. Measured: Debian trixie's clang 19 fails on
+`#pragma clang attribute` with `__visibility__`; Apple clang 21 builds these
+sources cleanly. CI installs `clang-23` from apt.llvm.org for an exact match.
 
 `LLVM_ENABLE_PER_TARGET_RUNTIME_DIR` is off. On, libc++ installs into
 `lib/<triple>/`, which clang would find but the *loader* would not — it is not
@@ -367,21 +381,25 @@ an emulator.
 | `tar`, `xz` | unpacks them |
 | `cmake` ≥ 3.20, `ninja` | LLVM's build system |
 | a host C/C++ compiler | step 4 builds the tablegen tools with it, not with the cross-compiler |
-| a host `clang` | step 5c: libobjc2 refuses to be built by anything else |
+| a host `clang`, ≈ as new as `LLVM_VERSION` | steps 5b and 5c: libc++'s headers and libobjc2 can only be built by clang |
 
 ```sh
 # macOS
 brew install make cmake ninja xz
 
 # Debian / Ubuntu
-sudo apt install make cmake ninja-build gcc g++ clang python3 curl ca-certificates xz-utils
+sudo apt install make cmake ninja-build gcc g++ python3 curl ca-certificates xz-utils
+# plus a current clang from apt.llvm.org, then: gmake HOST_CLANG=clang-23 …
 ```
 
-macOS needs nothing extra for the clang: Apple's own compiles for
-`aarch64-unknown-linux-musl` (verified on Apple clang 21). If a release ever
-cannot, `brew install llvm` and set
-`HOST_CLANG=/opt/homebrew/opt/llvm/bin/clang` — `gmake objc-runtime` checks the
-compiler before it uses it and says so rather than failing deep inside CMake.
+macOS needs nothing extra: Apple clang 21 compiles for
+`aarch64-unknown-linux-musl` and builds libc++ 23.1.0 — both verified. The
+distribution clang is the one to watch: **trixie's clang 19 is too old** and
+fails inside libc++'s headers, so CI takes `clang-23` from apt.llvm.org. If
+yours is too old, `brew install llvm` or apt.llvm.org, then set `HOST_CLANG`;
+`gmake runtimes` compiles *and links* a probe for the target before it uses the
+compiler, so a wrong one is reported in a line rather than 200 lines into a
+CMake log. `HOST_CLANGXX` is derived from it (`clang-23` → `clang++-23`).
 
 The host compiler is easy to overlook, because steps 1 to 3 use only the
 downloaded cross-toolchain and pass without one; step 4 is the first thing that

@@ -802,20 +802,39 @@ llvm-info: $(TARGET_STAMP) ## Show the cross-built binaries and what they need
 #   libcxxabi     the Itanium C++ ABI - exceptions, RTTI, the vtable layout.
 #   libcxx        the C++ standard library, headers included.
 #
-# Built with the *cross GCC*, not with a clang, which is the unusual-looking
-# choice here and is deliberate. A clang bootstrap has a chicken-and-egg step -
-# CMake's compiler check links a test program, which needs the builtins that
-# this build has not produced yet - and it would need a host clang that can
-# target musl. The cross GCC has its own libgcc and links test programs on the
-# first try, and it is the same compiler, sysroot and flags step 5 already
-# proved. libc++ supports being built by GCC; what matters is which runtime the
-# *shipped clang defaults to*, and that is set in step 5, not here.
+# Built with a *host clang* cross-targeting the device, not with the cross GCC
+# that builds everything else here. That was the first design and CI refuted it:
+# LLVM 23's libc++ headers are written against clang builtins GCC 14 does not
+# have - __is_unbounded_array, __is_pointer, __builtin_operator_new, __decay,
+# __add_lvalue_reference - so libc++abi dies ~1700 ninja steps in, with errors
+# *inside the libc++ headers* rather than in anything this repo wrote. Measured,
+# not read: compiler-rt and libunwind build fine under GCC (libunwind.so.1 was
+# linked); libc++ is the one that cannot. Do not "simplify" this back to the
+# cross GCC to match the other steps.
+#
+# The chicken-and-egg that made GCC look attractive is handled the way step 5c
+# handles it: clang's default rtlib on this target is libgcc, and the cross
+# toolchain's own libgcc is handed over with -L, so CMake's compiler check links
+# on the first try without needing the builtins this build has not produced yet.
+# The runtimes therefore link against libgcc for their own needs while the
+# *shipped clang* defaults to compiler-rt for user code - which is set in step 5,
+# not here.
 #
 # LLVM_ENABLE_PER_TARGET_RUNTIME_DIR is OFF on purpose. ON installs libc++ into
 # lib/<triple>/, which clang would find but the *loader* would not - it is not
 # on musl's default search path, so every program linked against libc++ would
 # fail to start. This device hosts exactly one target, so the flat layout is
 # both simpler and correct.
+#
+# compiler-rt's install path has to be said twice, and both times absolutely.
+# A *standalone* runtimes build defaults COMPILER_RT_INSTALL_PATH to empty, which
+# puts the builtins in <prefix>/lib/linux - not in the clang resource directory,
+# which is the only place the on-device clang looks for them, so -rtlib=compiler-rt
+# would fail on a card that looks complete. Setting COMPILER_RT_INSTALL_PATH alone
+# fixes a *fresh* tree only: compiler-rt derives COMPILER_RT_INSTALL_LIBRARY_DIR
+# from it into its own cache entry, and `set(... CACHE ...)` will not overwrite
+# that on a reconfigure, so an existing build/runtimes keeps installing to the old
+# place. Naming both is what makes this work whether the tree is new or not.
 #
 # Installed into the sysroot as well as into the stage: step 5c compiles
 # Objective-C++ against these headers, and --sysroot is how it finds them.
@@ -827,8 +846,39 @@ RUNTIMES_BUILD := $(BUILD_DIR)/runtimes
 RUNTIMES_LOG    = $(RUNTIMES_BUILD)/build.log
 RUNTIMES_STAMP  = $(RUNTIMES_BUILD)/.built
 
+# A clang on *this* machine that can emit aarch64 ELF, used by steps 5b and 5c
+# and by nothing else. It has to be roughly as new as the LLVM being built,
+# because step 5b compiles libc++'s own headers: measured, Debian trixie's
+# clang 19 fails on `#pragma clang attribute` with __visibility__, and GCC 14
+# fails earlier still on clang-only builtins. CI installs clang-$(LLVM_MAJOR)
+# from apt.llvm.org for an exact match; Apple clang 21 is new enough on macOS.
+HOST_CLANG   ?= clang
+
+# clang -> clang++, clang-23 -> clang++-23, /path/to/clang -> /path/to/clang++.
+# The naive $(HOST_CLANG)++ gets the versioned Debian names wrong - it produces
+# clang-23++, which does not exist - and the failure lands four steps and one
+# toolchain download later.
+HOST_CLANGXX ?= $(shell printf '%s' '$(HOST_CLANG)' \
+                  | sed -e 's|clang$$|clang++|' -e 's|clang\(-[0-9][0-9.]*\)$$|clang++\1|')
+
+# libgcc.a and libgcc_s.so.1 live in the toolchain, in two different
+# directories, and both are asked for by name rather than guessed at - the same
+# -print-file-name idiom the rest of this Makefile uses. Handing them to clang
+# is what lets its default -rtlib=libgcc link before compiler-rt exists.
+TC_LIBGCC_DIR = $(abspath $(dir $(shell $(CROSS)gcc -print-libgcc-file-name)))
+
+# --gcc-install-dir is what makes clang find crtbegin/crtend. Without it clang
+# hunts for a GCC installation by triple, finds none - these toolchains call
+# themselves aarch64-buildroot-linux-musl and aarch64-unknown-linux-musl, while
+# the product is built as the latter - and emits bare "crtbeginS.o" names that
+# the linker cannot resolve. -L does not cover it: those are input objects, not
+# libraries. The directory wanted is the one holding libgcc.a, which is exactly
+# what -print-libgcc-file-name names.
+CLANG_CROSS_LDFLAGS = --ld-path=$(CROSS)ld --gcc-install-dir=$(TC_LIBGCC_DIR) \
+                      -L$(TC_LIBGCC_DIR) $(CROSS_LDFLAGS)
+
 RUNTIMES_CFG := $(RUNTIMES_BUILD)/.config
-RUNTIMES_SIG  = $(LLVM_VERSION)|$(LLVM_RUNTIMES)|$(LLVM_TRIPLE)|$(TC_VENDOR)|$(TC_VERSION)|$(MUSL_VERSION)|$(CROSS_COMPILE)
+RUNTIMES_SIG  = $(LLVM_VERSION)|$(LLVM_RUNTIMES)|$(LLVM_TRIPLE)|$(TC_VENDOR)|$(TC_VERSION)|$(MUSL_VERSION)|$(CROSS_COMPILE)|$(HOST_CLANG)
 $(eval $(call config_stamp_rule,$(RUNTIMES_CFG),$(RUNTIMES_SIG)))
 
 RUNTIMES_CMAKE_FLAGS = \
@@ -836,21 +886,26 @@ RUNTIMES_CMAKE_FLAGS = \
   -DCMAKE_SYSTEM_NAME=Linux \
   -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
   -DCMAKE_SYSROOT=$(abspath $(SYSROOT)) \
-  -DCMAKE_C_COMPILER=$(CROSS)gcc \
-  -DCMAKE_CXX_COMPILER=$(CROSS)g++ \
-  -DCMAKE_ASM_COMPILER=$(CROSS)gcc \
+  -DCMAKE_C_COMPILER=$(HOST_CLANG) \
+  -DCMAKE_CXX_COMPILER=$(HOST_CLANGXX) \
+  -DCMAKE_ASM_COMPILER=$(HOST_CLANG) \
+  -DCMAKE_C_COMPILER_TARGET=$(LLVM_TRIPLE) \
+  -DCMAKE_CXX_COMPILER_TARGET=$(LLVM_TRIPLE) \
+  -DCMAKE_ASM_COMPILER_TARGET=$(LLVM_TRIPLE) \
   -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
   -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
   -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
   -DCMAKE_INSTALL_PREFIX=/usr \
-  "-DCMAKE_EXE_LINKER_FLAGS=$(CROSS_LDFLAGS)" \
-  "-DCMAKE_SHARED_LINKER_FLAGS=$(CROSS_LDFLAGS)" \
-  "-DCMAKE_MODULE_LINKER_FLAGS=$(CROSS_LDFLAGS)" \
+  "-DCMAKE_EXE_LINKER_FLAGS=$(CLANG_CROSS_LDFLAGS)" \
+  "-DCMAKE_SHARED_LINKER_FLAGS=$(CLANG_CROSS_LDFLAGS)" \
+  "-DCMAKE_MODULE_LINKER_FLAGS=$(CLANG_CROSS_LDFLAGS)" \
   -DLLVM_ENABLE_RUNTIMES="$(LLVM_RUNTIMES)" \
   -DLLVM_DEFAULT_TARGET_TRIPLE=$(LLVM_TRIPLE) \
   -DLLVM_TARGETS_TO_BUILD=$(LLVM_TARGETS) \
   -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF \
   -DLLVM_INCLUDE_TESTS=OFF \
+  -DCOMPILER_RT_INSTALL_PATH=/usr/lib/clang/$(LLVM_MAJOR) \
+  -DCOMPILER_RT_INSTALL_LIBRARY_DIR=/usr/lib/clang/$(LLVM_MAJOR)/lib/linux \
   -DCOMPILER_RT_BUILD_BUILTINS=ON \
   -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
   -DCOMPILER_RT_BUILD_XRAY=OFF \
@@ -881,6 +936,7 @@ runtimes: $(RUNTIMES_STAMP) ## Cross-build compiler-rt, libunwind, libc++abi and
 $(RUNTIMES_STAMP): $(MUSL_STAMP) $(LLVM_STAMP) $(RUNTIMES_CFG) Makefile
 	@$(call require_build_tools)
 	@$(call assert_cross_compiler)
+	@$(call assert_host_clang)
 	@mkdir -p $(RUNTIMES_BUILD)
 	@echo "  CONFIG   runtimes $(LLVM_RUNTIMES) (log: $(RUNTIMES_LOG))"
 	@$(SCRUB_ENV) cmake -G Ninja -S $(LLVM_SRC)/runtimes -B $(RUNTIMES_BUILD) \
@@ -915,10 +971,13 @@ define assert_runtimes
 	done; \
 	[ -f $(1)/include/c++/v1/vector ] \
 	  || { echo "  FAIL     libc++ headers are missing from $(1)/include/c++/v1" >&2; exit 1; }; \
-	b=$$(find $(1)/lib/clang/$(LLVM_MAJOR) -name 'libclang_rt.builtins*.a' -print 2>/dev/null | sed -n '1p'); \
+	b=$$(find $(1)/lib/clang/$(LLVM_MAJOR) -name 'libclang_rt.builtins*' -print 2>/dev/null | sed -n '1p') || true; \
 	if [ -z "$$b" ]; then \
-	  echo "  FAIL     no compiler-rt builtins under $(1)/lib/clang/$(LLVM_MAJOR); it holds:" >&2; \
-	  find $(1)/lib/clang/$(LLVM_MAJOR) -maxdepth 3 2>/dev/null | sed 's/^/           /' >&2; \
+	  echo "  FAIL     no compiler-rt builtins in the clang resource directory," >&2; \
+	  echo "           $(1)/lib/clang/$(LLVM_MAJOR)/lib/ - which is the only place" >&2; \
+	  echo "           the on-device clang looks. COMPILER_RT_INSTALL_PATH decides it." >&2; \
+	  echo "           What was installed instead:" >&2; \
+	  find $(1) -name 'libclang_rt*' 2>/dev/null | sed 's/^/             /' >&2 || true; \
 	  exit 1; \
 	fi; \
 	echo "  OK       libc++, libc++abi, libunwind, $$(basename $$b)"
@@ -970,6 +1029,25 @@ runtimes-info: $(RUNTIMES_STAMP) ## Show the cross-built runtimes and their size
 # GNUSTEP_INSTALL_TYPE is pinned to NONE so the layout is plain /usr/lib and
 # /usr/include; left alone, libobjc2 asks gnustep-config where to install and
 # would land somewhere else entirely on a developer machine that has GNUstep.
+#
+# OBJC and OBJCXX need their *own* CMAKE_<LANG>_COMPILER_TARGET. libobjc2 calls
+# enable_language(OBJC) after project(), and CMake treats those as languages
+# separate from C and CXX: without them the ObjC compiler check builds for the
+# *host*, and the aarch64 linker then rejects the result with "unrecognised
+# emulation mode: elf_x86_64" - which reads like a broken toolchain rather than
+# a missing flag. Any language this project enables needs a target here.
+#
+# -include stdlib.h is not decoration. libobjc2 2.3 calls abort() in
+# selector_table.cc without including it, and gets away with that against
+# libstdc++, which pulls it in transitively. libc++ has been deleting those
+# transitive includes for several releases, so against LLVM 23's the file simply
+# does not compile: "use of undeclared identifier 'abort'". Forcing the header in
+# is preferable to carrying a patch against an upstream release tarball; if a
+# later libobjc2 fixes the include, this can go.
+#
+# Note also that libobjc2 2.3 pulls robin-map with FetchContent while it
+# configures, so this step needs the network and downloads something that
+# checksums/ does not pin. That is upstream's choice, not a decision made here.
 # ---------------------------------------------------------------------------
 
 # libobjc2 publishes no release assets, so this is GitHub's generated archive of
@@ -996,19 +1074,9 @@ OBJC2_STAMP = $(OBJC2_DIR)/.installed
 # generically, so a newer runtime does not need a newer clang.
 OBJC_RUNTIME ?= gnustep-2.2
 
-# A clang on *this* machine that can emit aarch64 ELF. On Debian that is the
-# clang package; on macOS, Apple's clang can usually do it, and Homebrew's
-# (brew install llvm) certainly can - point HOST_CLANG at it if the assertion
-# below fails.
-HOST_CLANG   ?= clang
-HOST_CLANGXX ?= $(HOST_CLANG)++
-
-# libgcc.a and libgcc_s.so.1 live in the toolchain, in two different
-# directories, and both are asked for by name rather than guessed at - the same
-# -print-file-name idiom the rest of this Makefile uses.
-TC_LIBGCC_DIR = $(abspath $(dir $(shell $(CROSS)gcc -print-libgcc-file-name)))
-OBJC2_LDFLAGS = --ld-path=$(CROSS)ld -L$(TC_LIBGCC_DIR) $(CROSS_LDFLAGS) \
-                -L$(abspath $(SYSROOT))/usr/lib
+# Step 5b's link setup, plus the runtimes it has by now installed into the
+# sysroot - libc++ and libunwind, which the Objective-C++ half links against.
+OBJC2_LDFLAGS = $(CLANG_CROSS_LDFLAGS) -L$(abspath $(SYSROOT))/usr/lib
 
 OBJC2_CFG := $(OBJC2_DIR)/.config
 OBJC2_SIG  = $(OBJC2_VERSION)|$(LLVM_TRIPLE)|$(MUSL_VERSION)|$(TC_VENDOR)|$(TC_VERSION)|$(CROSS_COMPILE)|$(HOST_CLANG)
@@ -1022,15 +1090,20 @@ OBJC2_CMAKE_FLAGS = \
   -DCMAKE_C_COMPILER=$(HOST_CLANG) \
   -DCMAKE_CXX_COMPILER=$(HOST_CLANGXX) \
   -DCMAKE_ASM_COMPILER=$(HOST_CLANG) \
+  -DCMAKE_OBJC_COMPILER=$(HOST_CLANG) \
+  -DCMAKE_OBJCXX_COMPILER=$(HOST_CLANGXX) \
   -DCMAKE_C_COMPILER_TARGET=$(LLVM_TRIPLE) \
   -DCMAKE_CXX_COMPILER_TARGET=$(LLVM_TRIPLE) \
   -DCMAKE_ASM_COMPILER_TARGET=$(LLVM_TRIPLE) \
+  -DCMAKE_OBJC_COMPILER_TARGET=$(LLVM_TRIPLE) \
+  -DCMAKE_OBJCXX_COMPILER_TARGET=$(LLVM_TRIPLE) \
   -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
   -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
   -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
   -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_INSTALL_LIBDIR=lib \
-  -DCMAKE_CXX_FLAGS=-stdlib=libc++ \
+  "-DCMAKE_CXX_FLAGS=-stdlib=libc++ -include stdlib.h" \
+  "-DCMAKE_OBJCXX_FLAGS=-stdlib=libc++ -include stdlib.h" \
   "-DCMAKE_EXE_LINKER_FLAGS=$(OBJC2_LDFLAGS)" \
   "-DCMAKE_SHARED_LINKER_FLAGS=$(OBJC2_LDFLAGS)" \
   "-DCMAKE_MODULE_LINKER_FLAGS=$(OBJC2_LDFLAGS)" \
@@ -1085,31 +1158,40 @@ $(OBJC2_STAMP): $(RUNTIMES_STAMP) $(OBJC2_CFG) Makefile
 	@$(call assert_objc_runtime,$(abspath $(SYSROOT))/usr)
 	@touch $@
 
-# The one tool this build needs that is neither downloaded nor built here, so
-# it is checked before it is used rather than failing 200 lines into a CMake
-# log. Apple's clang is not guaranteed to emit Linux ELF on every release,
-# which is exactly what this catches.
+# The one tool this build needs that is neither downloaded nor built here, used
+# by step 5b and step 5c, so it is checked before either uses it rather than
+# failing 200 lines into a CMake log. Apple's clang is not guaranteed to emit
+# Linux ELF on every release, which is one thing this catches.
+#
+# It compiles *and links*, deliberately: linking is what exercises --ld-path,
+# the -L that makes clang's default -rtlib=libgcc resolve, and the crt objects
+# in the sysroot - exactly what CMake's own compiler check does as its first act
+# in both steps. A pass here means that check will pass.
 define assert_host_clang
 	set -e; \
 	for c in $(HOST_CLANG) $(HOST_CLANGXX); do \
 	  command -v "$$c" >/dev/null 2>&1 || { \
-	    echo "  FAIL     $$c not found - libobjc2 can only be built by clang" >&2; \
-	    echo "           (Debian: apt install clang, macOS: brew install llvm," >&2; \
-	    echo "            then HOST_CLANG=/opt/homebrew/opt/llvm/bin/clang)" >&2; \
+	    echo "  FAIL     $$c not found - libc++ and libobjc2 can only be built by clang," >&2; \
+	    echo "           and it must be about as new as LLVM $(LLVM_VERSION) itself." >&2; \
+	    echo "           Debian/Ubuntu: apt.llvm.org, then HOST_CLANG=clang-$(LLVM_MAJOR)" >&2; \
+	    echo "                          (the distro's own clang 19 is too old)" >&2; \
+	    echo "           macOS:         Apple clang 21+, or brew install llvm and" >&2; \
+	    echo "                          HOST_CLANG=/opt/homebrew/opt/llvm/bin/clang" >&2; \
 	    exit 1; }; \
 	done; \
 	t=$$(mktemp -d); \
-	printf 'int probe(void){return 0;}\n' > $$t/probe.c; \
+	printf 'int main(void){return 0;}\n' > $$t/probe.c; \
 	if ! $(HOST_CLANG) --target=$(LLVM_TRIPLE) --sysroot=$(abspath $(SYSROOT)) \
-	     -c $$t/probe.c -o $$t/probe.o 2> $$t/err; then \
-	  echo "  FAIL     $(HOST_CLANG) cannot compile for $(LLVM_TRIPLE):" >&2; \
+	     $(CLANG_CROSS_LDFLAGS) $$t/probe.c -o $$t/probe 2> $$t/err; then \
+	  echo "  FAIL     $(HOST_CLANG) cannot build for $(LLVM_TRIPLE):" >&2; \
 	  sed 's/^/           /' $$t/err >&2; rm -rf $$t; exit 1; \
 	fi; \
-	if ! $(CROSS)readelf -h $$t/probe.o | grep -q AArch64; then \
+	if ! $(CROSS)readelf -h $$t/probe | grep -q AArch64; then \
 	  echo "  FAIL     $(HOST_CLANG) produced something that is not aarch64" >&2; \
 	  rm -rf $$t; exit 1; \
 	fi; \
-	rm -rf $$t
+	rm -rf $$t; \
+	echo "  OK       $(HOST_CLANG) builds and links for $(LLVM_TRIPLE)"
 endef
 
 # $(1) the usr/ prefix to look under.

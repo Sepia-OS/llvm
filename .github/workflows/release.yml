@@ -182,19 +182,34 @@ jobs:
       #
       # gcc/g++ are the *host* compiler, for the tablegen tools in step 4; the
       # cross toolchain is downloaded and covers nothing that runs here. Keep
-      # this list identical to ci.yml's, or a release builds in a container CI
-      # never tested.
+      # this list, and the clang step below, identical to ci.yml's - or a
+      # release builds in a container CI never tested.
       - name: Install build tools
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            make cmake ninja-build gcc g++ clang python3 git curl ca-certificates xz-utils
+            make cmake ninja-build gcc g++ python3 git curl ca-certificates xz-utils
 
       # The release branch, not the dispatched ref: this is the whole point of
       # having branched.
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.gate.outputs.branch }}
+
+      # Steps 5b and 5c need a clang about as new as the LLVM being built -
+      # trixie's clang 19 and GCC 14 both fail on libc++ 23's headers. The
+      # version is read from the Makefile, and exported so every later make sees
+      # it: HOST_CLANG is part of the runtimes' config signature. See ci.yml.
+      - name: Install a clang matching the pinned LLVM
+        run: |
+          major="$(make -s print-LLVM_MAJOR)"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /usr/share/keyrings/llvm.asc
+          echo "deb [signed-by=/usr/share/keyrings/llvm.asc] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-${major} main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends "clang-${major}"
+          echo "HOST_CLANG=clang-${major}" >> "$GITHUB_ENV"
+          "clang-${major}" --version | head -1
 
       # Everything the release notes say about the product is read out of the
       # Makefile rather than written twice. print-% and these variable names
