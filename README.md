@@ -267,7 +267,12 @@ own builtin headers, 253 of them, without which it cannot compile anything.
 `gmake stage-check` reads the result back and asserts that every staged binary
 is aarch64, uses the musl loader, and has a complete shared-library closure —
 every `NEEDED` entry either staged here or supplied by `rootfs`'s musl, which
-is the only thing allowed to be missing. It then checks that each language has
+is the only thing allowed to be missing. The closure is walked over the staged
+**libraries** as well as the binaries, and that is deliberate: a library's
+`NEEDED` entry is resolved just as eagerly as a binary's, so one that nothing
+provides kills every program linked against it. Checking only `clang` and `lld`
+once let a `libc++.so.1` that wanted a `libatomic.so.1` out of this repository
+entirely, to be caught downstream in `rootfs`. It then checks that each language has
 what it needs on the card: clang's builtin headers for C, libc++'s headers and
 libraries for C++, the objc headers and `libobjc.so` for Objective-C, the
 builtins archive for linking anything at all, and the config file that sets the

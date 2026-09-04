@@ -877,11 +877,15 @@ TC_LIBGCC_DIR = $(abspath $(dir $(shell $(CROSS)gcc -print-libgcc-file-name)))
 CLANG_CROSS_LDFLAGS = --ld-path=$(CROSS)ld --gcc-install-dir=$(TC_LIBGCC_DIR) \
                       -L$(TC_LIBGCC_DIR) $(CROSS_LDFLAGS)
 
-RUNTIMES_CFG := $(RUNTIMES_BUILD)/.config
-RUNTIMES_SIG  = $(LLVM_VERSION)|$(LLVM_RUNTIMES)|$(LLVM_TRIPLE)|$(TC_VENDOR)|$(TC_VERSION)|$(MUSL_VERSION)|$(CROSS_COMPILE)|$(HOST_CLANG)
-$(eval $(call config_stamp_rule,$(RUNTIMES_CFG),$(RUNTIMES_SIG)))
-
-RUNTIMES_CMAKE_FLAGS = \
+# The cross setup: where the sysroot is, which compilers drive the build, how
+# they are told to link. Deliberately kept out of RUNTIMES_SIG below - these
+# reach CLANG_CROSS_LDFLAGS, hence TC_LIBGCC_DIR, which shells out to the cross
+# gcc. A signature is expanded at parse time, so signing them would run that
+# probe on every `gmake help` and yield nothing at all before the toolchain has
+# been downloaded. What they encode is which toolchain and which sysroot, and
+# TC_VENDOR, TC_VERSION, CROSS_COMPILE, HOST_CLANG, MUSL_VERSION and
+# LLVM_TRIPLE already say that.
+RUNTIMES_CROSS_FLAGS = \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_SYSTEM_NAME=Linux \
   -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
@@ -898,7 +902,26 @@ RUNTIMES_CMAKE_FLAGS = \
   -DCMAKE_INSTALL_PREFIX=/usr \
   "-DCMAKE_EXE_LINKER_FLAGS=$(CLANG_CROSS_LDFLAGS)" \
   "-DCMAKE_SHARED_LINKER_FLAGS=$(CLANG_CROSS_LDFLAGS)" \
-  "-DCMAKE_MODULE_LINKER_FLAGS=$(CLANG_CROSS_LDFLAGS)" \
+  "-DCMAKE_MODULE_LINKER_FLAGS=$(CLANG_CROSS_LDFLAGS)"
+
+# What actually gets built, and it is signed: change a switch here and the
+# stamp moves, so the runtimes are reconfigured instead of the old libc++
+# being silently reused and the wrong binary verified.
+#
+# LIBCXX_HAS_ATOMIC_LIB is set rather than probed. libcxx's config-ix.cmake
+# runs check_library_exists(atomic __atomic_fetch_add_8 "" ...), which asks
+# whether the toolchain *has* a libatomic - not whether libc++ *uses* one - and
+# CMakeLists.txt then links -latomic on that answer alone. The link is not
+# --as-needed, so libc++.so.1 records DT_NEEDED libatomic.so.1 while
+# referencing nothing from it, and since DT_NEEDED is loaded eagerly every
+# program linked against libc++ dies at exec on a card that has no libatomic.
+# Measured on the v23.1.0 asset: not one of libc++'s 230 undefined symbols is
+# a __atomic_* one. check_library_exists is guarded by
+# if(NOT DEFINED "${VARIABLE}"), so a cache value on the configure line skips
+# the probe entirely. If a future libc++ ever does need 16-byte atomics this
+# turns into a link error rather than a silent gap - and the answer then is to
+# drop this flag and add libatomic.so.1 to CXX_RUNTIME_LIBS.
+RUNTIMES_FEATURE_FLAGS = \
   -DLLVM_ENABLE_RUNTIMES="$(LLVM_RUNTIMES)" \
   -DLLVM_DEFAULT_TARGET_TRIPLE=$(LLVM_TRIPLE) \
   -DLLVM_TARGETS_TO_BUILD=$(LLVM_TARGETS) \
@@ -927,7 +950,14 @@ RUNTIMES_CMAKE_FLAGS = \
   -DLIBCXX_ENABLE_STATIC=OFF \
   -DLIBCXX_INCLUDE_TESTS=OFF \
   -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+  -DLIBCXX_HAS_ATOMIC_LIB=NO \
   -DLIBCXX_INSTALL_LIBRARY_DIR=lib
+
+RUNTIMES_CMAKE_FLAGS = $(RUNTIMES_CROSS_FLAGS) $(RUNTIMES_FEATURE_FLAGS)
+
+RUNTIMES_CFG := $(RUNTIMES_BUILD)/.config
+RUNTIMES_SIG  = $(LLVM_VERSION)|$(LLVM_RUNTIMES)|$(LLVM_TRIPLE)|$(TC_VENDOR)|$(TC_VERSION)|$(MUSL_VERSION)|$(CROSS_COMPILE)|$(HOST_CLANG)|$(RUNTIMES_FEATURE_FLAGS)
+$(eval $(call config_stamp_rule,$(RUNTIMES_CFG),$(RUNTIMES_SIG)))
 
 .PHONY: runtimes
 runtimes: $(RUNTIMES_STAMP) ## Cross-build compiler-rt, libunwind, libc++abi and libc++
@@ -1353,6 +1383,36 @@ stage-info: $(STAGE_STAMP) ## Show what the staged tree contains and its size
 # library closure has to be complete. Anything a staged binary needs must be
 # either in the stage or supplied by rootfs's musl - and libc.so is the only
 # thing in that second category.
+#
+# The closure is walked over the staged *libraries* as well as the two
+# binaries, and that is the whole point: an earlier version read the DT_NEEDED
+# of clang and lld only, so when libc++.so.1 came out of the build recording a
+# libatomic.so.1 that nothing ships, no step here ever opened its dynamic
+# section. The gap escaped to rootfs and was caught one repository downstream.
+# A library's dependency is as load-bearing as a binary's - DT_NEEDED is
+# resolved eagerly, so an unsatisfied one kills every program that links it.
+#
+# Two things the glob catches that are not ELF objects. Symlinks are the
+# obvious one - libc++.so.1 and its .1.0 target are the same file twice. The
+# other is usr/lib/libc++.so, which is an ASCII *linker script* reading
+# INPUT(libc++.so.1 -lc++abi -lunwind); readelf cannot parse it, and because
+# the readelf runs inside a `for` word list its failure would otherwise be
+# swallowed and the file counted as a library with no dependencies at all -
+# a check reporting success on something it never read. So non-ELF files are
+# skipped on the magic number, the strip_stage idiom, and a readelf that fails
+# on a file that *is* ELF is fatal.
+define assert_closure
+	deps=$$($(CROSS)readelf -d "$(1)" \
+	         | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p') \
+	  || { echo "  FAIL     cannot read the dynamic section of $(2)" >&2; exit 1; }; \
+	for dep in $$deps; do \
+	  [ "$$dep" = "libc.so" ] && continue; \
+	  [ -e $(STAGE_DIR)/usr/lib/$$dep ] \
+	    || { echo "  FAIL     $(2) needs $$dep, which is not staged and is not musl" >&2; \
+	         exit 1; }; \
+	done
+endef
+
 .PHONY: stage-check
 stage-check: $(STAGE_STAMP) ## Verify the staged tree is aarch64 and self-contained
 	@set -e; \
@@ -1363,14 +1423,19 @@ stage-check: $(STAGE_STAMP) ## Verify the staged tree is aarch64 and self-contai
 	     || { echo "  FAIL     staged $$b is not aarch64" >&2; exit 1; }; \
 	   $(CROSS)readelf -l "$$p" | grep -q 'ld-musl-aarch64.so.1' \
 	     || { echo "  FAIL     staged $$b does not use the musl loader" >&2; exit 1; }; \
-	   for n in $$($(CROSS)readelf -d "$$p" \
-	                | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do \
-	     [ "$$n" = "libc.so" ] && continue; \
-	     [ -e $(STAGE_DIR)/usr/lib/$$n ] \
-	       || { echo "  FAIL     $$b needs $$n, which is not staged and is not musl" >&2; exit 1; }; \
-	   done; \
+	   $(call assert_closure,$$p,$$b); \
 	   echo "  OK       $$b aarch64, musl loader, closure complete"; \
 	 done
+	@set -e; libs=0; \
+	 for p in $(STAGE_DIR)/usr/lib/*.so*; do \
+	   if [ -L "$$p" ] || [ ! -f "$$p" ]; then continue; fi; \
+	   if [ "$$(od -An -tx1 -N4 "$$p" | tr -d ' \n')" != "7f454c46" ]; then continue; fi; \
+	   $(call assert_closure,$$p,$${p##*/}); \
+	   libs=$$((libs + 1)); \
+	 done; \
+	 [ "$$libs" -gt 0 ] \
+	   || { echo "  FAIL     no staged shared libraries to check" >&2; exit 1; }; \
+	 echo "  OK       $$libs staged libraries, closure complete"
 	@$(call assert_runtimes,$(STAGE_DIR)/usr)
 	@$(call assert_objc_runtime,$(STAGE_DIR)/usr)
 	@$(call assert_language_support)
